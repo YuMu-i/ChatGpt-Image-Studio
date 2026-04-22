@@ -9,14 +9,19 @@ echo "[1/4] Running backend tests..."
 cd "$BACKEND_DIR"
 go test ./...
 
-echo "[2/4] Running frontend type check..."
+echo "[2/4] Ensuring frontend dependencies..."
 cd "$WEB_DIR"
+if [ ! -d node_modules ]; then
+  npm ci
+fi
+
+echo "[3/5] Running frontend type check..."
 npx tsc --noEmit
 
-echo "[3/4] Running frontend lint..."
+echo "[4/5] Running frontend lint..."
 npm run lint
 
-echo "[4/4] Running frontend production build..."
+echo "[5/5] Running frontend production build..."
 npm run build
 
 echo "Checks complete."
