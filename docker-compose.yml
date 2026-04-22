@@ -1,0 +1,13 @@
+services:
+  studio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7000:7000"
+    environment:
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 7000
+    volumes:
+      - ./backend/data:/app/backend/data
+    restart: unless-stopped

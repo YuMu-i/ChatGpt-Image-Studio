@@ -1,0 +1,8 @@
+[app]
+auth_key = "chatgpt2api"
+
+[sync]
+enabled = true
+base_url = "http://127.0.0.1:8317"
+management_key = "your-cliproxy-management-key"
+provider_type = "codex"
