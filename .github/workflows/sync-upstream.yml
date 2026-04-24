@@ -1,0 +1,56 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 1 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/peiyizhi0724/ChatGpt-Image-Studio.git
+          git fetch upstream main
+
+      - name: Merge upstream into sync branch
+        run: |
+          git checkout -B chore/upstream-sync origin/main
+          git merge --no-edit upstream/main
+
+      - name: Open sync pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/upstream-sync
+          base: main
+          title: "chore: sync upstream changes"
+          commit-message: "chore: sync upstream changes"
+          delete-branch: true
+          body: |
+            ## What this PR does
+
+            - pulls the latest commits from `peiyizhi0724/ChatGpt-Image-Studio`
+            - merges them into this fork's `main`
+            - keeps custom work in the fork while making upstream updates easy to review
+
+            ## Suggested rollout
+
+            1. Review the diff and resolve any conflicts with your custom features.
+            2. Test the merged result on `main`.
+            3. Merge or cherry-pick the validated changes into `production` when ready to deploy.
