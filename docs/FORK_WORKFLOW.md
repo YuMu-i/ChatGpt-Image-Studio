@@ -22,6 +22,14 @@ Recommended flow:
 
 The workflow at `.github/workflows/deploy-production.yml` deploys whenever `production` is updated.
 
+The workflow at `.github/workflows/prepare-production-pr.yml` automatically opens or updates a PR from `main` to `production` whenever `main` changes.
+That means your release flow becomes:
+
+1. Review and merge upstream sync PRs into `main`.
+2. Build or customize features on `main`.
+3. Review the auto-generated `release: promote main to production` PR.
+4. Merge that PR when you want to deploy.
+
 Required repository secrets:
 
 - `DEPLOY_HOST`: server IP or domain
