@@ -22,6 +22,14 @@ Recommended flow:
 
 The workflow at `.github/workflows/deploy-production.yml` deploys whenever `production` is updated.
 
+The workflow at `.github/workflows/prepare-production-pr.yml` automatically opens or updates a PR from `main` to `production` whenever `main` changes.
+That means your release flow becomes:
+
+1. Review and merge upstream sync PRs into `main`.
+2. Build or customize features on `main`.
+3. Review the auto-generated `release: promote main to production` PR.
+4. Merge that PR when you want to deploy.
+
 Required repository secrets:
 
 - `DEPLOY_HOST`: server IP or domain
@@ -40,7 +48,7 @@ Run these commands on the server so the deployed code tracks your fork instead o
 
 ```bash
 cd /opt/projects/ChatGpt-Image-Studio
-git remote set-url origin git@github.com:YuMu-i/ChatGpt-Image-Studio.git
+git remote set-url origin https://github.com/YuMu-i/ChatGpt-Image-Studio.git
 git fetch origin
 git checkout -B main origin/main
 git checkout -B production origin/main
