@@ -58,6 +58,27 @@ func TestParseResponsesSSEDeduplicatesFinalImages(t *testing.T) {
 	}
 }
 
+func TestParseResponsesSSEAcceptsLargeImageEvents(t *testing.T) {
+	largeB64 := strings.Repeat("A", 10*1024*1024+4096)
+	stream := `data: {"type":"response.completed","response":{"output":[{"type":"image_generation_call","result":"` + largeB64 + `","output_format":"png"}]}}` + "\n\n"
+
+	client := &ResponsesClient{}
+	images, err := client.parseResponsesSSE(strings.NewReader(stream), "prompt")
+	if err != nil {
+		t.Fatalf("parseResponsesSSE() returned error: %v", err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("parseResponsesSSE() len = %d, want %d", len(images), 1)
+	}
+	if !strings.HasPrefix(images[0].URL, "data:image/png;base64,") {
+		prefix := images[0].URL
+		if len(prefix) > 32 {
+			prefix = prefix[:32]
+		}
+		t.Fatalf("parseResponsesSSE() url prefix = %q", prefix)
+	}
+}
+
 func TestSupportsResponsesInlineEdit(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -65,6 +86,12 @@ func TestSupportsResponsesInlineEdit(t *testing.T) {
 		mask   []byte
 		want   bool
 	}{
+		{
+			name:   "single image and mask are allowed within threshold",
+			images: [][]byte{make([]byte, 8)},
+			mask:   make([]byte, 8),
+			want:   true,
+		},
 		{
 			name:   "single small image is allowed",
 			images: [][]byte{make([]byte, 32*1024)},
@@ -97,6 +124,73 @@ func TestSupportsResponsesInlineEdit(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesImageGenerationToolIncludesSupportedSize(t *testing.T) {
+	tool, err := buildResponsesImageGenerationToolWithOptions(responsesImageToolOptions{
+		RequestedModel: "gpt-image-2",
+		Action:         "edit",
+		Size:           "1536x1024",
+		Quality:        "hd",
+		Background:     "opaque",
+		Mask:           []byte("mask"),
+	})
+	if err != nil {
+		t.Fatalf("buildResponsesImageGenerationTool() returned error: %v", err)
+	}
+
+	if got := tool["model"]; got != "gpt-image-2" {
+		t.Fatalf("tool model = %v, want %q", got, "gpt-image-2")
+	}
+	if got := tool["action"]; got != "edit" {
+		t.Fatalf("tool action = %v, want %q", got, "edit")
+	}
+	if got := tool["size"]; got != "1536x1024" {
+		t.Fatalf("tool size = %v, want %q", got, "1536x1024")
+	}
+	if got := tool["quality"]; got != "high" {
+		t.Fatalf("tool quality = %v, want %q", got, "high")
+	}
+	if got := tool["background"]; got != "opaque" {
+		t.Fatalf("tool background = %v, want %q", got, "opaque")
+	}
+	maskField, ok := tool["input_image_mask"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool input_image_mask missing: %#v", tool)
+	}
+	if _, ok := maskField["image_url"]; !ok {
+		t.Fatalf("tool input_image_mask.image_url missing: %#v", tool)
+	}
+}
+
+func TestBuildResponsesImageGenerationToolRejectsUnsupportedSize(t *testing.T) {
+	tool, err := buildResponsesImageGenerationToolWithOptions(responsesImageToolOptions{
+		RequestedModel: "gpt-image-2",
+		Action:         "generate",
+		Size:           "8192x8192",
+	})
+	if err == nil {
+		t.Fatalf("buildResponsesImageGenerationTool() returned nil error, tool=%#v", tool)
+	}
+}
+
+func TestNormalizeResponsesImageToolModel(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "gpt image 1 stays gpt image 1", input: "gpt-image-1", want: "gpt-image-1"},
+		{name: "gpt image 2 stays gpt image 2", input: "gpt-image-2", want: "gpt-image-2"},
+		{name: "other values fall back to gpt image 2", input: "gpt-5.4-mini", want: "gpt-image-2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeResponsesImageToolModel(tt.input); got != tt.want {
+				t.Fatalf("normalizeResponsesImageToolModel(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNewResponsesClientWithProxyAndConfigUsesProvidedSSETimeout(t *testing.T) {
 	requestConfig := ImageRequestConfig{
 		RequestTimeout: 15 * time.Second,
@@ -118,7 +212,7 @@ func TestNewResponsesClientWithProxyAndConfigUsesProvidedSSETimeout(t *testing.T
 	if client.backend.pollInterval != requestConfig.PollInterval {
 		t.Fatalf("backend poll interval = %v, want %v", client.backend.pollInterval, requestConfig.PollInterval)
 	}
-	if client.backend.pollMaxWait != requestConfig.PollMaxWait {
-		t.Fatalf("backend poll max wait = %v, want %v", client.backend.pollMaxWait, requestConfig.PollMaxWait)
+	if client.backend.pollMaxWait != requestConfig.SSETimeout {
+		t.Fatalf("backend poll max wait = %v, want %v", client.backend.pollMaxWait, requestConfig.SSETimeout)
 	}
 }

@@ -39,7 +39,7 @@ export function isImageTaskActive(conversationId: string, turnId: string) {
 }
 
 export function listActiveImageTasks() {
-  return Array.from(activeTasks.values()).sort((a, b) => a.startedAt - b.startedAt);
+  return Array.from(activeTasks.values()).sort((a, b) => b.startedAt - a.startedAt);
 }
 
 export function subscribeImageTasks(listener: Listener) {

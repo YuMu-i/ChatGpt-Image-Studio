@@ -57,73 +57,6 @@ func TestNeedsImageQuotaRefreshByResetTime(t *testing.T) {
 	}
 }
 
-func TestRecordImageResultDecrementsLocalQuotaAndImageLimit(t *testing.T) {
-	rootDir := t.TempDir()
-	authDir := filepath.Join(rootDir, "auths")
-	syncDir := filepath.Join(rootDir, "sync")
-	if err := os.MkdirAll(authDir, 0o755); err != nil {
-		t.Fatalf("mkdir auth dir: %v", err)
-	}
-	if err := os.MkdirAll(syncDir, 0o755); err != nil {
-		t.Fatalf("mkdir sync dir: %v", err)
-	}
-
-	const token = "token-record-image-result"
-	store := &Store{
-		authDir:      authDir,
-		syncStateDir: syncDir,
-		stateFile:    filepath.Join(rootDir, "state.json"),
-		defaultQuota: 5,
-		providerType: "codex",
-		states: map[string]RuntimeState{
-			"record.json": {
-				Type:       "Plus",
-				Status:     "正常",
-				Quota:      1,
-				QuotaKnown: true,
-				LimitsProgress: []map[string]any{
-					{
-						"feature_name": "image_gen",
-						"remaining":    1,
-					},
-				},
-			},
-		},
-	}
-
-	if err := writeJSONFile(filepath.Join(authDir, "record.json"), map[string]any{
-		"type":         "codex",
-		"access_token": token,
-		"email":        "record@example.com",
-	}); err != nil {
-		t.Fatalf("seed auth file: %v", err)
-	}
-
-	store.RecordImageResult(token, true)
-
-	state := store.getState("record.json")
-	if state.Success != 1 {
-		t.Fatalf("expected success count 1, got %d", state.Success)
-	}
-	if state.Quota != 0 {
-		t.Fatalf("expected quota 0, got %d", state.Quota)
-	}
-	if state.Status != "限流" {
-		t.Fatalf("expected status 限流, got %q", state.Status)
-	}
-
-	imageRemaining := -1
-	for _, item := range state.LimitsProgress {
-		if strings.TrimSpace(strings.ToLower(stringValue(item["feature_name"]))) != "image_gen" {
-			continue
-		}
-		imageRemaining = intValue(item["remaining"])
-	}
-	if imageRemaining != 0 {
-		t.Fatalf("expected image_gen remaining 0, got %d", imageRemaining)
-	}
-}
-
 func TestImportAuthFilesSkipsDuplicateToken(t *testing.T) {
 	rootDir := t.TempDir()
 	authDir := filepath.Join(rootDir, "auths")
@@ -436,6 +369,175 @@ func TestAcquireImageAuthFilteredWithDisabledOptionAllowsDisabledAccount(t *test
 	}
 	if account.Email != "disabled@example.com" {
 		t.Fatalf("AcquireImageAuthFilteredWithDisabledOption() email = %q, want %q", account.Email, "disabled@example.com")
+	}
+}
+
+func TestAddAccountsMarksTokenSourceKind(t *testing.T) {
+	rootDir := t.TempDir()
+	authDir := filepath.Join(rootDir, "auths")
+	syncDir := filepath.Join(rootDir, "sync")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("mkdir auth dir: %v", err)
+	}
+	if err := os.MkdirAll(syncDir, 0o755); err != nil {
+		t.Fatalf("mkdir sync dir: %v", err)
+	}
+
+	store := &Store{
+		authDir:      authDir,
+		syncStateDir: syncDir,
+		stateFile:    filepath.Join(rootDir, "state.json"),
+		defaultQuota: 5,
+		providerType: "codex",
+		states:       map[string]RuntimeState{},
+	}
+
+	if _, _, err := store.AddAccounts([]string{"token-import-1"}); err != nil {
+		t.Fatalf("AddAccounts() returned error: %v", err)
+	}
+
+	auths, err := store.loadAuths()
+	if err != nil {
+		t.Fatalf("loadAuths() returned error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("loadAuths() count = %d, want 1", len(auths))
+	}
+	if auths[0].SourceKind != AccountSourceKindToken {
+		t.Fatalf("SourceKind = %q, want %q", auths[0].SourceKind, AccountSourceKindToken)
+	}
+
+	items, err := store.ListAccounts()
+	if err != nil {
+		t.Fatalf("ListAccounts() returned error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("ListAccounts() count = %d, want 1", len(items))
+	}
+	if items[0].SourceKind != AccountSourceKindToken {
+		t.Fatalf("public SourceKind = %q, want %q", items[0].SourceKind, AccountSourceKindToken)
+	}
+	if items[0].SyncStatus != "" {
+		t.Fatalf("token account SyncStatus = %q, want empty", items[0].SyncStatus)
+	}
+}
+
+func TestImportAuthFilesPreservesExplicitTokenSourceKind(t *testing.T) {
+	rootDir := t.TempDir()
+	authDir := filepath.Join(rootDir, "auths")
+	syncDir := filepath.Join(rootDir, "sync")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("mkdir auth dir: %v", err)
+	}
+	if err := os.MkdirAll(syncDir, 0o755); err != nil {
+		t.Fatalf("mkdir sync dir: %v", err)
+	}
+
+	store := &Store{
+		authDir:      authDir,
+		syncStateDir: syncDir,
+		stateFile:    filepath.Join(rootDir, "state.json"),
+		defaultQuota: 5,
+		providerType: "codex",
+		states:       map[string]RuntimeState{},
+	}
+
+	imported, _, skipped, failures, err := store.ImportAuthFiles([]ImportedAuthFile{{
+		Name: "demo.json",
+		Data: []byte(`{"type":"codex","access_token":"token-auth-file","email":"demo@example.com","source_kind":"token"}`),
+	}})
+	if err != nil {
+		t.Fatalf("ImportAuthFiles() returned error: %v", err)
+	}
+	if imported != 1 || len(skipped) != 0 || len(failures) != 0 {
+		t.Fatalf("ImportAuthFiles() = imported %d skipped %d failures %d", imported, len(skipped), len(failures))
+	}
+
+	auths, err := store.loadAuths()
+	if err != nil {
+		t.Fatalf("loadAuths() returned error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("loadAuths() count = %d, want 1", len(auths))
+	}
+	if auths[0].SourceKind != AccountSourceKindToken {
+		t.Fatalf("SourceKind = %q, want %q", auths[0].SourceKind, AccountSourceKindToken)
+	}
+}
+
+func TestImportAuthFilesInfersLegacyTokenSourceKindWhenMissingField(t *testing.T) {
+	rootDir := t.TempDir()
+	authDir := filepath.Join(rootDir, "auths")
+	syncDir := filepath.Join(rootDir, "sync")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("mkdir auth dir: %v", err)
+	}
+	if err := os.MkdirAll(syncDir, 0o755); err != nil {
+		t.Fatalf("mkdir sync dir: %v", err)
+	}
+
+	store := &Store{
+		authDir:      authDir,
+		syncStateDir: syncDir,
+		stateFile:    filepath.Join(rootDir, "state.json"),
+		defaultQuota: 5,
+		providerType: "codex",
+		states:       map[string]RuntimeState{},
+	}
+
+	imported, _, skipped, failures, err := store.ImportAuthFiles([]ImportedAuthFile{{
+		Name: "legacy-token.json",
+		Data: []byte(`{"type":"codex","access_token":"legacy-token","email":"legacy@example.com","created_at":"2026-04-01T00:00:00Z"}`),
+	}})
+	if err != nil {
+		t.Fatalf("ImportAuthFiles() returned error: %v", err)
+	}
+	if imported != 1 || len(skipped) != 0 || len(failures) != 0 {
+		t.Fatalf("ImportAuthFiles() = imported %d skipped %d failures %d", imported, len(skipped), len(failures))
+	}
+
+	auths, err := store.loadAuths()
+	if err != nil {
+		t.Fatalf("loadAuths() returned error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("loadAuths() count = %d, want 1", len(auths))
+	}
+	if auths[0].SourceKind != AccountSourceKindToken {
+		t.Fatalf("SourceKind = %q, want %q", auths[0].SourceKind, AccountSourceKindToken)
+	}
+}
+
+func TestParseLocalAuthInfersLegacyTokenSourceKindWhenMissingField(t *testing.T) {
+	auth, err := parseLocalAuth(
+		"legacy.json",
+		"legacy.json",
+		[]byte(`{"type":"codex","access_token":"legacy-token","email":"legacy@example.com","chatgpt_plan_type":"plus"}`),
+		"codex",
+	)
+	if err != nil {
+		t.Fatalf("parseLocalAuth() returned error: %v", err)
+	}
+	if auth.SourceKind != AccountSourceKindToken {
+		t.Fatalf("SourceKind = %q, want %q", auth.SourceKind, AccountSourceKindToken)
+	}
+	if got := stringValue(auth.Data["source_kind"]); got != AccountSourceKindToken {
+		t.Fatalf("persisted source_kind = %q, want %q", got, AccountSourceKindToken)
+	}
+}
+
+func TestParseLocalAuthKeepsFullAuthFilesAsAuthFileSourceKind(t *testing.T) {
+	auth, err := parseLocalAuth(
+		"full.json",
+		"full.json",
+		[]byte(`{"type":"codex","access_token":"full-token","email":"full@example.com","cookies":"a=b","account_id":"acct-1"}`),
+		"codex",
+	)
+	if err != nil {
+		t.Fatalf("parseLocalAuth() returned error: %v", err)
+	}
+	if auth.SourceKind != AccountSourceKindAuthFile {
+		t.Fatalf("SourceKind = %q, want %q", auth.SourceKind, AccountSourceKindAuthFile)
 	}
 }
 

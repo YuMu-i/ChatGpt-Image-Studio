@@ -15,7 +15,6 @@ backend/*.log
 backend/tmp-*.json
 backend/tmp-*.png
 backend/data/*
-!backend/data/config.toml.example
 !backend/data/auths/
 !backend/data/auths/.gitkeep
 !backend/data/sync_state/

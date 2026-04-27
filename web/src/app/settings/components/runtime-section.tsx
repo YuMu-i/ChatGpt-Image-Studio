@@ -101,6 +101,54 @@ export function RuntimeSection({ config, setSection }: RuntimeSectionProps) {
         />
       </Field>
       <Field
+        label="图片并发上限"
+        hint="同时允许多少个图片生成/编辑请求进入执行。"
+      >
+        <Input
+          type="number"
+          value={String(config.server.maxImageConcurrency)}
+          onChange={(event) =>
+            setSection("server", {
+              ...config.server,
+              maxImageConcurrency: Number(event.target.value || 0),
+            })
+          }
+          className="h-11 rounded-2xl border-stone-200 bg-white shadow-none"
+        />
+      </Field>
+      <Field
+        label="图片排队上限"
+        hint="超出并发上限后，最多允许多少个请求继续排队等待。"
+      >
+        <Input
+          type="number"
+          value={String(config.server.imageQueueLimit)}
+          onChange={(event) =>
+            setSection("server", {
+              ...config.server,
+              imageQueueLimit: Number(event.target.value || 0),
+            })
+          }
+          className="h-11 rounded-2xl border-stone-200 bg-white shadow-none"
+        />
+      </Field>
+      <Field
+        label="图片排队超时（秒）"
+        hint="排队等待超过这个时间后，请求会直接返回超时。"
+      >
+        <Input
+          type="number"
+          value={String(config.server.imageQueueTimeoutSeconds)}
+          onChange={(event) =>
+            setSection("server", {
+              ...config.server,
+              imageQueueTimeoutSeconds: Number(event.target.value || 0),
+            })
+          }
+          className="h-11 rounded-2xl border-stone-200 bg-white shadow-none"
+        />
+      </Field>
+      <Field
         label="图片返回格式"
         hint="当前项目自身图片接口默认返回格式。"
         tooltip={
@@ -148,7 +196,7 @@ export function RuntimeSection({ config, setSection }: RuntimeSectionProps) {
               },
               {
                 title: "太小的表现",
-                body: <>编辑、放大或参考图上传会直接失败，即使图片本身格式没问题也会被拒绝。</>,
+                body: <>编辑或参考图上传会直接失败，即使图片本身格式没问题也会被拒绝。</>,
               },
             ]}
           />
@@ -425,6 +473,22 @@ export function RuntimeSection({ config, setSection }: RuntimeSectionProps) {
             setSection("accounts", {
               ...config.accounts,
               autoRefreshInterval: Number(event.target.value || 0),
+            })
+          }
+          className="h-11 rounded-2xl border-stone-200 bg-white shadow-none"
+        />
+      </Field>
+      <Field
+        label="额度刷新 TTL（秒）"
+        hint="账号刚刷新过额度时，在这个时间窗口内优先复用结果，减少重复打上游。"
+      >
+        <Input
+          type="number"
+          value={String(config.accounts.imageQuotaRefreshTTLSeconds)}
+          onChange={(event) =>
+            setSection("accounts", {
+              ...config.accounts,
+              imageQuotaRefreshTTLSeconds: Number(event.target.value || 0),
             })
           }
           className="h-11 rounded-2xl border-stone-200 bg-white shadow-none"

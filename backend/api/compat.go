@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"chatgpt2api/handler"
+	"chatgpt2api/internal/accounts"
+	"chatgpt2api/internal/imaging"
 )
 
 type imageGenerationRequest struct {
@@ -31,6 +33,8 @@ type imageEditRequest struct {
 	Prompt         string
 	Images         [][]byte
 	Mask           []byte
+	Size           string
+	Quality        string
 	ResponseFormat string
 }
 
@@ -92,16 +96,32 @@ func (s *Server) executeImageGeneration(ctx context.Context, req imageGeneration
 	if req.N < 1 {
 		req.N = 1
 	}
+	size := normalizeGenerateImageSize(req.Size)
+	requirePaidAccount := s.configuredImageMode() == "studio" && imaging.RequiresPaidGenerateAccount(size)
 
 	requestedModel := normalizeRequestedImageModel(req.Model, s.cfg.ChatGPT.Model)
 	responseFormat := firstNonEmpty(req.ResponseFormat, s.cfg.App.ImageFormat, "url")
 	combined := make([]map[string]any, 0, req.N)
 	imageErrors := make([]string, 0)
+	var firstRequestErr error
 	for range req.N {
-		data, err := s.withImageResults(ctx, "generate", responseFormat, "", requestedModel, true, func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
-			return client.GenerateImage(ctx, prompt, upstreamModel, 1, req.Size, req.Quality, req.Background)
+		var allowAccount func(accounts.PublicAccount) bool
+		if requirePaidAccount {
+			allowAccount = func(account accounts.PublicAccount) bool {
+				return isPaidImageAccountType(account.Type)
+			}
+		}
+
+		data, err := s.withImageResultsFilteredWithMetadata(ctx, "generate", responseFormat, "", requestedModel, true, allowAccount, newImageRequestMetadata(prompt, size, req.Quality), func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
+			return client.GenerateImage(ctx, prompt, upstreamModel, 1, size, req.Quality, req.Background)
 		}, r)
 		if err != nil {
+			if requirePaidAccount && errors.Is(err, accounts.ErrNoAvailableImageAuth) {
+				err = newRequestError("paid_resolution_requires_paid_account", "当前分辨率仅支持 Plus / Pro / Team 图片账号，请先确保有可用 Paid 账号")
+			}
+			if firstRequestErr == nil && requestErrorCode(err) != "" {
+				firstRequestErr = err
+			}
 			imageErrors = append(imageErrors, err.Error())
 			continue
 		}
@@ -109,6 +129,9 @@ func (s *Server) executeImageGeneration(ctx context.Context, req imageGeneration
 	}
 
 	if len(combined) == 0 {
+		if firstRequestErr != nil {
+			return nil, firstRequestErr
+		}
 		return nil, errors.New(firstNonEmpty(strings.Join(imageErrors, "; "), "image generation failed"))
 	}
 
@@ -122,6 +145,10 @@ func (s *Server) executeImageGeneration(ctx context.Context, req imageGeneration
 	return payload, nil
 }
 
+func normalizeGenerateImageSize(value string) string {
+	return imaging.NormalizeGenerateSize(value)
+}
+
 func (s *Server) executeImageEdit(ctx context.Context, req imageEditRequest, r *http.Request) (map[string]any, error) {
 	prompt := strings.TrimSpace(req.Prompt)
 	if prompt == "" {
@@ -133,8 +160,8 @@ func (s *Server) executeImageEdit(ctx context.Context, req imageEditRequest, r *
 
 	requestedModel := normalizeRequestedImageModel(req.Model, s.cfg.ChatGPT.Model)
 	responseFormat := firstNonEmpty(req.ResponseFormat, s.cfg.App.ImageFormat, "url")
-	data, err := s.withImageResults(ctx, "edit", responseFormat, "", requestedModel, handler.SupportsResponsesInlineEdit(req.Images, req.Mask), func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
-		return client.EditImageByUpload(ctx, prompt, upstreamModel, req.Images, req.Mask)
+	data, err := s.withImageResultsWithMetadata(ctx, "edit", responseFormat, "", requestedModel, handler.SupportsResponsesInlineEdit(req.Images, req.Mask), newImageRequestMetadata(prompt, req.Size, req.Quality), func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
+		return client.EditImageByUpload(ctx, prompt, upstreamModel, req.Images, req.Mask, req.Size, req.Quality)
 	}, r)
 	if err != nil {
 		return nil, err
@@ -255,6 +282,8 @@ func (s *Server) runCompatImageRequest(ctx context.Context, r *http.Request, req
 		Model:          req.RequestedModel,
 		Prompt:         req.Prompt,
 		Images:         images,
+		Size:           req.Size,
+		Quality:        req.Quality,
 		ResponseFormat: "b64_json",
 	}, r)
 }

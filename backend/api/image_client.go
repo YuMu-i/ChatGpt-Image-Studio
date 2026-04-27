@@ -14,3 +14,9 @@ type imageDownloader interface {
 type imageWorkflowClient interface {
 	handler.ImageWorkflowClient
 }
+
+type cpaRouteAwareImageWorkflowClient interface {
+	imageWorkflowClient
+	LastRoute() string
+	LastModelLabel() string
+}

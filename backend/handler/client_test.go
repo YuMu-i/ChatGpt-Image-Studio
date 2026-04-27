@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -192,6 +193,151 @@ func TestBuildConversationBodyUsesProvidedModel(t *testing.T) {
 	}
 }
 
+func TestGenerateImagePrefersFConversation(t *testing.T) {
+	client := &ChatGPTClient{
+		accessToken: "token",
+		oaiDeviceID: "device",
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/sentinel/chat-requirements"):
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"token":"sentinel","proofofwork":{"required":false}}`)),
+					}, nil
+				case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/attachment/file-f/download"):
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"download_url":"https://files.example/f.png"}`)),
+					}, nil
+				default:
+					t.Fatalf("unexpected http request: %s %s", req.Method, req.URL.String())
+					return nil, nil
+				}
+			}),
+		},
+		streamClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodPost || !strings.HasSuffix(req.URL.Path, "/f/conversation") {
+					t.Fatalf("unexpected stream request: %s %s", req.Method, req.URL.String())
+				}
+				stream := strings.Join([]string{
+					`data: {"conversation_id":"conv-f","message":{"id":"tool-f","author":{"role":"tool"},"status":"finished_successfully","content":{"content_type":"multimodal_text","parts":[{"content_type":"image_asset_pointer","asset_pointer":"sediment://file-f","metadata":{"dalle":{"gen_id":"gen-f","prompt":"prompt"}}}]}}}`,
+					"",
+					`data: [DONE]`,
+					"",
+				}, "\n")
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(stream)),
+				}, nil
+			}),
+		},
+	}
+
+	images, err := client.GenerateImage(context.Background(), "draw a cat", "auto", 1, "1024x1024", "", "")
+	if err != nil {
+		t.Fatalf("GenerateImage returned error: %v", err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("GenerateImage len = %d, want 1", len(images))
+	}
+	if got := client.LastRoute(); got != "f-conversation" {
+		t.Fatalf("LastRoute() = %q, want %q", got, "f-conversation")
+	}
+}
+
+func TestGenerateImageFallsBackToConversationWhenFConversationFails(t *testing.T) {
+	client := &ChatGPTClient{
+		accessToken: "token",
+		oaiDeviceID: "device",
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/sentinel/chat-requirements"):
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"token":"sentinel","proofofwork":{"required":false}}`)),
+					}, nil
+				case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/attachment/file-c/download"):
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"download_url":"https://files.example/c.png"}`)),
+					}, nil
+				default:
+					t.Fatalf("unexpected http request: %s %s", req.Method, req.URL.String())
+					return nil, nil
+				}
+			}),
+		},
+		streamClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/f/conversation"):
+					return &http.Response{
+						StatusCode: http.StatusInternalServerError,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"error":"boom"}`)),
+					}, nil
+				case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/conversation"):
+					stream := strings.Join([]string{
+						`data: {"conversation_id":"conv-c","message":{"id":"tool-c","author":{"role":"tool"},"status":"finished_successfully","content":{"content_type":"multimodal_text","parts":[{"content_type":"image_asset_pointer","asset_pointer":"sediment://file-c","metadata":{"dalle":{"gen_id":"gen-c","prompt":"prompt"}}}]}}}`,
+						"",
+						`data: [DONE]`,
+						"",
+					}, "\n")
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(stream)),
+					}, nil
+				default:
+					t.Fatalf("unexpected stream request: %s %s", req.Method, req.URL.String())
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	images, err := client.GenerateImage(context.Background(), "draw a cat", "auto", 1, "1024x1024", "", "")
+	if err != nil {
+		t.Fatalf("GenerateImage returned error: %v", err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("GenerateImage len = %d, want 1", len(images))
+	}
+	if got := client.LastRoute(); got != "conversation" {
+		t.Fatalf("LastRoute() = %q, want %q", got, "conversation")
+	}
+}
+
+func TestShouldFallbackFromFConversation(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "request error falls back", err: io.ErrUnexpectedEOF, want: false},
+		{name: "labeled request error falls back", err: errors.New("f conversation request: dial tcp timeout"), want: true},
+		{name: "5xx response falls back", err: errors.New("f conversation returned 500: boom"), want: true},
+		{name: "sse read error does not fall back", err: errors.New("SSE read error: unexpected EOF"), want: false},
+		{name: "internal error marker alone does not fall back", err: errors.New("internal_error"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldFallbackFromFConversation(tt.err); got != tt.want {
+				t.Fatalf("shouldFallbackFromFConversation(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNewChatGPTClientWithProxyAndConfigUsesProvidedTimeouts(t *testing.T) {
 	requestConfig := ImageRequestConfig{
 		RequestTimeout: 12 * time.Second,
@@ -210,7 +356,7 @@ func TestNewChatGPTClientWithProxyAndConfigUsesProvidedTimeouts(t *testing.T) {
 	if client.pollInterval != requestConfig.PollInterval {
 		t.Fatalf("poll interval = %v, want %v", client.pollInterval, requestConfig.PollInterval)
 	}
-	if client.pollMaxWait != requestConfig.PollMaxWait {
-		t.Fatalf("poll max wait = %v, want %v", client.pollMaxWait, requestConfig.PollMaxWait)
+	if client.pollMaxWait != requestConfig.SSETimeout {
+		t.Fatalf("poll max wait = %v, want %v", client.pollMaxWait, requestConfig.SSETimeout)
 	}
 }

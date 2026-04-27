@@ -1,8 +1,17 @@
 import { httpRequest } from "@/lib/request";
+import webConfig from "@/constants/common-env";
+import { getStoredAuthKey } from "@/store/auth";
+import { buildImageAccountPolicyHeader } from "@/store/image-account-policy";
 
 export type AccountType = "Free" | "Plus" | "Pro" | "Team";
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
-export type SyncStatus = "synced" | "pending_upload" | "remote_only" | "remote_deleted";
+export type SyncStatus =
+  | "synced"
+  | "pending_upload"
+  | "remote_only"
+  | "remote_deleted";
+export type SyncSource = "cpa" | "newapi" | "sub2api";
+export type AccountSourceKind = "auth_file" | "token";
 export type ImageModel = "gpt-image-1" | "gpt-image-2";
 export type ImageQuality = "low" | "medium" | "high";
 export type ImageResponseItem = {
@@ -28,6 +37,7 @@ export type Account = {
   id: string;
   fileName: string;
   access_token: string;
+  sourceKind?: AccountSourceKind | null;
   type: AccountType;
   status: AccountStatus;
   quota: number;
@@ -51,6 +61,7 @@ export type Account = {
   syncOrigin?: string | null;
   lastSyncedAt?: string | null;
   remoteDisabled?: boolean | null;
+  importedAt?: string | null;
 };
 
 export type SyncAccount = {
@@ -63,26 +74,37 @@ export type SyncAccount = {
 
 export type SyncRunResult = {
   ok: boolean;
+  running?: boolean;
+  source: SyncSource;
   error?: string;
   direction?: string;
-  uploaded: number;
-  upload_failed: number;
-  downloaded: number;
-  download_failed: number;
-  remote_deleted: number;
-  disabled_aligned: number;
-  disabled_align_failed: number;
+  imported: number;
+  exported: number;
+  skipped: number;
+  failed: number;
+  inaccessible: number;
+  total?: number;
+  processed?: number;
+  phase?: string;
+  current?: string;
+  notes?: string[];
   started_at: string;
   finished_at: string;
+  updated_at?: string;
 };
 
 export type SyncStatusResponse = {
+  source: SyncSource;
+  label: string;
   configured: boolean;
+  pullSupported: boolean;
+  pushSupported: boolean;
   local: number;
   remote: number;
-  summary: Record<SyncStatus, number>;
-  accounts: SyncAccount[];
-  disabledMismatch: number;
+  pendingPush: number;
+  pendingPull: number;
+  inaccessibleRemote: number;
+  notes?: string[];
   lastRun?: SyncRunResult | null;
 };
 
@@ -113,6 +135,25 @@ type AccountRefreshResponse = {
   items: Account[];
   refreshed: number;
   errors: Array<{ access_token: string; error: string }>;
+};
+
+export type AccountRefreshProgress = {
+  ok: boolean;
+  running: boolean;
+  error?: string;
+  total: number;
+  processed: number;
+  refreshed: number;
+  failed: number;
+  current?: string;
+  started_at: string;
+  finished_at: string;
+  updated_at?: string;
+};
+
+type AccountRefreshAllResponse = {
+  progress: AccountRefreshProgress | null;
+  alreadyRunning?: boolean;
 };
 
 type AccountUpdateResponse = {
@@ -153,6 +194,9 @@ export type ConfigPayload = {
     host: string;
     port: number;
     staticDir: string;
+    maxImageConcurrency: number;
+    imageQueueLimit: number;
+    imageQueueTimeoutSeconds: number;
   };
   chatgpt: {
     model: string;
@@ -173,12 +217,23 @@ export type ConfigPayload = {
     refreshWorkers: number;
     autoRefreshEnabled: boolean;
     autoRefreshInterval: number;
+    imageQuotaRefreshTTLSeconds: number;
   };
   storage: {
+    backend: string;
+    configBackend: "file" | "redis" | string;
     authDir: string;
     stateFile: string;
     syncStateDir: string;
     imageDir: string;
+    imageStorage: "browser" | "server" | string;
+    imageConversationStorage: "browser" | "server" | string;
+    imageDataStorage: "browser" | "server" | string;
+    sqlitePath: string;
+    redisAddr: string;
+    redisPassword: string;
+    redisDb: number;
+    redisPrefix: string;
   };
   sync: {
     enabled: boolean;
@@ -200,6 +255,23 @@ export type ConfigPayload = {
     requestTimeout: number;
     routeStrategy: "images_api" | "codex_responses" | "auto";
   };
+  newapi: {
+    baseUrl: string;
+    username: string;
+    password: string;
+    accessToken: string;
+    userId: number;
+    sessionCookie: string;
+    requestTimeout: number;
+  };
+  sub2api: {
+    baseUrl: string;
+    email: string;
+    password: string;
+    apiKey: string;
+    groupId: string;
+    requestTimeout: number;
+  };
   log: {
     logAllRequests: boolean;
   };
@@ -220,6 +292,14 @@ export type RequestLogItem = {
   direction: "official" | "cpa" | string;
   route: string;
   cpaSubroute?: "images_api" | "codex_responses" | "auto" | string;
+  queueWaitMs?: number;
+  inflightCountAtStart?: number;
+  leaseAcquired?: boolean;
+  errorCode?: string;
+  routingPolicyApplied?: boolean;
+  routingGroupIndex?: number;
+  routingSortMode?: string;
+  routingReservePercent?: number;
   accountType?: string;
   accountEmail?: string;
   accountFile?: string;
@@ -238,6 +318,94 @@ export type VersionInfo = {
   version: string;
   commit?: string;
   buildTime?: string;
+};
+
+export type StartupCheckItem = {
+  key: string;
+  label: string;
+  status: "pass" | "warn" | "fail" | string;
+  detail: string;
+  hint?: string;
+  durationMs: number;
+};
+
+export type StartupCheckResponse = {
+  startedAt: string;
+  finishedAt: string;
+  mode: "studio" | "cpa" | string;
+  overall: "pass" | "warn" | "fail" | string;
+  passCount: number;
+  warnCount: number;
+  failCount: number;
+  checks: StartupCheckItem[];
+  summaryText: string;
+};
+
+export type RuntimeStatusResponse = {
+  timestamp: string;
+  mode: "studio" | "cpa" | string;
+  admission: {
+    maxConcurrency: number;
+    queueLimit: number;
+    queueTimeoutMs: number;
+    inflight: number;
+    queued: number;
+  };
+  accounts: {
+    total: number;
+    available: number;
+    availablePaid: number;
+  };
+  recent: {
+    windowSeconds: number;
+    failureCount: number;
+    lastError?: string;
+    lastErrorCode?: string;
+    lastErrorAt?: string;
+    lastErrorAccount?: string;
+  };
+};
+
+export type ProxyTestResult = {
+  ok: boolean;
+  status: number;
+  latency: number;
+  error?: string;
+};
+
+export type IntegrationTestResult = {
+  ok: boolean;
+  source: SyncSource | "cpa";
+  message: string;
+  status: number;
+  latency: number;
+  userId?: number;
+  username?: string;
+  email?: string;
+  groupCount?: number;
+};
+
+export type NewAPITokenDiscoverResult = {
+  ok: boolean;
+  message: string;
+  latency: number;
+  accessToken?: string;
+  userId?: number;
+};
+
+export type Sub2APIGroupOption = {
+  id: string;
+  name: string;
+  description: string;
+  platform: string;
+  status: string;
+};
+
+export type Sub2APIGroupsResult = {
+  ok: boolean;
+  message: string;
+  latency: number;
+  groups: Sub2APIGroupOption[];
 };
 
 export async function login(authKey: string) {
@@ -286,6 +454,19 @@ export async function refreshAccounts(accessTokens: string[]) {
   });
 }
 
+export async function refreshAllAccounts() {
+  return httpRequest<AccountRefreshAllResponse>("/api/accounts/refresh-all", {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function fetchAccountRefreshProgress() {
+  return httpRequest<AccountRefreshAllResponse>(
+    "/api/accounts/refresh-progress",
+  );
+}
+
 export async function updateAccount(
   accessToken: string,
   updates: {
@@ -304,18 +485,75 @@ export async function updateAccount(
   });
 }
 
-export async function fetchAccountQuota(accountId: string, options: { refresh?: boolean } = {}) {
+export async function fetchAccountQuota(
+  accountId: string,
+  options: { refresh?: boolean } = {},
+) {
   const refresh = options.refresh ?? true;
   const suffix = refresh ? "" : "?refresh=false";
-  return httpRequest<AccountQuotaResponse>(`/api/accounts/${encodeURIComponent(accountId)}/quota${suffix}`);
+  return httpRequest<AccountQuotaResponse>(
+    `/api/accounts/${encodeURIComponent(accountId)}/quota${suffix}`,
+  );
 }
 
-export async function fetchSyncStatus() {
-  return httpRequest<SyncStatusResponse>("/api/sync/status");
+export async function fetchSyncStatus(
+  source: SyncSource = "cpa",
+  options: { progressOnly?: boolean } = {},
+) {
+  const params = new URLSearchParams({ source });
+  if (options.progressOnly) {
+    params.set("progress_only", "1");
+  }
+  return httpRequest<SyncStatusResponse>(
+    `/api/sync/status?${params.toString()}`,
+  );
 }
 
 export async function fetchConfig() {
   return httpRequest<ConfigPayload>("/api/config");
+}
+
+export async function testProxy(url?: string) {
+  return httpRequest<ProxyTestResult>("/api/proxy/test", {
+    method: "POST",
+    body: { url: url ?? "" },
+  });
+}
+
+export async function testIntegration(
+  source: "cpa" | "newapi" | "sub2api",
+  payload: {
+    cpa?: ConfigPayload["cpa"];
+    newapi?: ConfigPayload["newapi"];
+    sub2api?: ConfigPayload["sub2api"];
+  },
+) {
+  return httpRequest<IntegrationTestResult>("/api/integration/test", {
+    method: "POST",
+    body: {
+      source,
+      cpa: payload.cpa,
+      newapi: payload.newapi,
+      sub2api: payload.sub2api,
+    },
+  });
+}
+
+export async function discoverNewAPIToken(newapi: ConfigPayload["newapi"]) {
+  return httpRequest<NewAPITokenDiscoverResult>(
+    "/api/integration/newapi/token",
+    {
+      method: "POST",
+      body: { newapi },
+    },
+  );
+}
+
+export async function fetchSub2APIGroups(sub2api: ConfigPayload["sub2api"]) {
+  return httpRequest<Sub2APIGroupsResult>("/api/integration/sub2api/groups", {
+    method: "POST",
+    body: { sub2api },
+  });
 }
 
 export async function fetchDefaultConfig() {
@@ -339,14 +577,64 @@ export async function fetchVersionInfo() {
   });
 }
 
-export async function runSync(direction: "pull" | "push") {
-  return httpRequest<{ result: SyncRunResult; status?: SyncStatusResponse }>("/api/sync/run", {
-    method: "POST",
-    body: { direction },
-  });
+export async function fetchStartupCheck() {
+  return httpRequest<StartupCheckResponse>("/api/startup/check");
 }
 
-export async function generateImage(prompt: string, model: ImageModel = "gpt-image-2", count = 1) {
+export async function fetchRuntimeStatus() {
+  return httpRequest<RuntimeStatusResponse>("/api/runtime/status");
+}
+
+export async function downloadDiagnosticsExport() {
+  const authKey = await getStoredAuthKey();
+  const response = await fetch(
+    `${webConfig.apiUrl.replace(/\/$/, "")}/api/diagnostics/export`,
+    {
+      method: "GET",
+      headers: authKey ? { Authorization: `Bearer ${authKey}` } : {},
+    },
+  );
+  if (!response.ok) {
+    let message = `download failed (${response.status})`;
+    try {
+      const payload = (await response.json()) as {
+        error?: string;
+        message?: string;
+        detail?: { message?: string };
+      };
+      message =
+        payload?.detail?.message || payload?.message || payload?.error || message;
+    } catch {
+      // ignore json parse errors
+    }
+    throw new Error(message);
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get("content-disposition") || "";
+  const match = disposition.match(/filename="([^"]+)"/i);
+  const fileName =
+    match?.[1] || `chatgpt-image-studio-diagnostics-${Date.now()}.json`;
+  return { blob, fileName };
+}
+
+export async function runSync(
+  direction: "pull" | "push",
+  source: SyncSource = "cpa",
+) {
+  return httpRequest<{ result: SyncRunResult; status?: SyncStatusResponse }>(
+    "/api/sync/run",
+    {
+      method: "POST",
+      body: { direction, source },
+    },
+  );
+}
+
+export async function generateImage(
+  prompt: string,
+  model: ImageModel = "gpt-image-2",
+  count = 1,
+) {
   return generateImageWithOptions(prompt, { model, count });
 }
 
@@ -360,8 +648,12 @@ export async function generateImageWithOptions(
   } = {},
 ) {
   const { model = "gpt-image-2", count = 1, size, quality = "high" } = options;
+  const policyHeader = buildImageAccountPolicyHeader();
   return httpRequest<ImageResponse>("/v1/images/generations", {
     method: "POST",
+    headers: policyHeader
+      ? { "X-Studio-Account-Policy": policyHeader }
+      : undefined,
     body: {
       prompt,
       model,
@@ -378,18 +670,29 @@ export async function editImage({
   images,
   mask,
   sourceReference,
+  size,
+  quality,
   model = "gpt-image-2",
 }: {
   prompt: string;
   images: File[];
   mask?: File | null;
   sourceReference?: InpaintSourceReference;
+  size?: string;
+  quality?: ImageQuality;
   model?: ImageModel;
 }) {
   const formData = new FormData();
+  const policyHeader = buildImageAccountPolicyHeader();
   formData.append("prompt", prompt);
   formData.append("model", model);
   formData.append("response_format", "b64_json");
+  if (size?.trim()) {
+    formData.append("size", size.trim());
+  }
+  if (quality) {
+    formData.append("quality", quality);
+  }
   images.forEach((file) => formData.append("image", file));
   if (mask) {
     formData.append("mask", mask);
@@ -407,31 +710,9 @@ export async function editImage({
   }
   return httpRequest<ImageResponse>("/v1/images/edits", {
     method: "POST",
-    body: formData,
-  });
-}
-
-export async function upscaleImage({
-  image,
-  prompt,
-  scale,
-  model = "gpt-image-2",
-}: {
-  image: File;
-  prompt?: string;
-  scale?: string;
-  model?: ImageModel;
-}) {
-  const formData = new FormData();
-  formData.append("image", image);
-  formData.append("model", model);
-  formData.append("response_format", "b64_json");
-  formData.append("scale", scale || "2x");
-  if (prompt?.trim()) {
-    formData.append("prompt", prompt.trim());
-  }
-  return httpRequest<ImageResponse>("/v1/images/upscale", {
-    method: "POST",
+    headers: policyHeader
+      ? { "X-Studio-Account-Policy": policyHeader }
+      : undefined,
     body: formData,
   });
 }
