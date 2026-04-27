@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"chatgpt2api/handler"
@@ -21,15 +22,40 @@ import (
 	"chatgpt2api/internal/buildinfo"
 	"chatgpt2api/internal/cliproxy"
 	"chatgpt2api/internal/config"
+	"chatgpt2api/internal/mailer"
 	"chatgpt2api/internal/middleware"
+	"chatgpt2api/internal/newapi"
+	"chatgpt2api/internal/sub2api"
+	"chatgpt2api/internal/users"
+	"chatgpt2api/internal/verification"
 )
 
 type Server struct {
-	cfg        *config.Config
-	store      *accounts.Store
-	syncClient *cliproxy.Client
-	staticDir  string
-	reqLogs    *imageRequestLogStore
+	cfg                    *config.Config
+	runtimeMu              sync.RWMutex
+	store                  *accounts.Store
+	userStore              *users.Store
+	syncClient             *cliproxy.Client
+	syncRunMu              sync.RWMutex
+	syncRunCache           map[string]*sourceSyncRunResult
+	accountRefreshMu       sync.RWMutex
+	accountRefreshRun      *accountRefreshRunResult
+	staticDir              string
+	portalStaticDir        string
+	reqLogs                *imageRequestLogStore
+	mailer                 *mailer.Sender
+	verifier               *verification.Store
+	imageAdmission         *imageAdmissionController
+	officialClientFactory  func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient
+	responsesClientFactory func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient
+	cpaClientFactory       func(baseURL, apiKey string, timeout time.Duration, routeStrategy string) cpaRouteAwareImageWorkflowClient
+	newAPIClientFactory    func(cfg *config.Config) *newapi.Client
+	sub2apiClientFactory   func(cfg *config.Config) *sub2api.Client
+	sourceClientMu         sync.Mutex
+	cachedNewAPIClient     *newapi.Client
+	cachedNewAPIKey        string
+	cachedSub2APIClient    *sub2api.Client
+	cachedSub2APIKey       string
 }
 
 type requestError struct {
@@ -37,20 +63,328 @@ type requestError struct {
 	message string
 }
 
+type accountRefreshRunResult struct {
+	OK         bool   `json:"ok"`
+	Running    bool   `json:"running"`
+	Error      string `json:"error,omitempty"`
+	Total      int    `json:"total"`
+	Processed  int    `json:"processed"`
+	Refreshed  int    `json:"refreshed"`
+	Failed     int    `json:"failed"`
+	Current    string `json:"current,omitempty"`
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at"`
+	UpdatedAt  string `json:"updated_at,omitempty"`
+}
+
 const cpaFixedImageModel = "gpt-image-2"
+const maxBulkAccountRefreshWorkers = 4
 
 func (e *requestError) Error() string {
 	return firstNonEmpty(e.message, e.code)
 }
 
-func NewServer(cfg *config.Config, store *accounts.Store, syncClient *cliproxy.Client) *Server {
+func NewServer(cfg *config.Config, store *accounts.Store, userStore *users.Store, syncClient *cliproxy.Client) *Server {
+	codeTTLMinutes := max(1, cfg.Mail.CodeTTLMinutes)
+	resendIntervalSeconds := max(1, cfg.Mail.ResendInterval)
+
 	return &Server{
-		cfg:        cfg,
-		store:      store,
-		syncClient: syncClient,
-		staticDir:  cfg.ResolvePath(cfg.Server.StaticDir),
-		reqLogs:    newImageRequestLogStore(),
+		cfg:             cfg,
+		store:           store,
+		userStore:       userStore,
+		syncClient:      syncClient,
+		syncRunCache:    map[string]*sourceSyncRunResult{},
+		staticDir:       cfg.ResolvePath(cfg.Server.StaticDir),
+		portalStaticDir: cfg.ResolvePath("portal-static"),
+		reqLogs:         newImageRequestLogStore(),
+		mailer:          mailer.NewSender(cfg.Mail),
+		verifier: verification.NewStore(
+			time.Duration(codeTTLMinutes)*time.Minute,
+			time.Duration(resendIntervalSeconds)*time.Second,
+		),
+		imageAdmission: newImageAdmissionController(),
+		officialClientFactory: func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient {
+			return handler.NewChatGPTClientWithProxyAndConfig(
+				accessToken,
+				firstNonEmpty(stringValue(authData["cookies"]), stringValue(authData["cookie"])),
+				proxyURL,
+				requestConfig,
+			)
+		},
+		responsesClientFactory: func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient {
+			return handler.NewResponsesClientWithProxyAndConfig(accessToken, proxyURL, authData, requestConfig)
+		},
+		cpaClientFactory: func(baseURL, apiKey string, timeout time.Duration, routeStrategy string) cpaRouteAwareImageWorkflowClient {
+			return newCPAImageClient(baseURL, apiKey, timeout, routeStrategy)
+		},
+		newAPIClientFactory: func(cfg *config.Config) *newapi.Client {
+			timeout := time.Duration(max(10, cfg.NewAPI.RequestTimeout)) * time.Second
+			return newapi.New(
+				cfg.NewAPI.BaseURL,
+				cfg.NewAPI.Username,
+				cfg.NewAPI.Password,
+				cfg.NewAPI.AccessToken,
+				cfg.NewAPI.UserID,
+				cfg.NewAPI.SessionCookie,
+				timeout,
+				cfg.SyncProxyURL(),
+			)
+		},
+		sub2apiClientFactory: func(cfg *config.Config) *sub2api.Client {
+			timeout := time.Duration(max(10, cfg.Sub2API.RequestTimeout)) * time.Second
+			return sub2api.New(
+				cfg.Sub2API.BaseURL,
+				cfg.Sub2API.Email,
+				cfg.Sub2API.Password,
+				cfg.Sub2API.APIKey,
+				cfg.Sub2API.GroupID,
+				timeout,
+				cfg.SyncProxyURL(),
+			)
+		},
 	}
+}
+
+func (s *Server) getStore() *accounts.Store {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+	return s.store
+}
+
+func (s *Server) getSyncClient() *cliproxy.Client {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+	return s.syncClient
+}
+
+func (s *Server) getStaticDir() string {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
+	return s.staticDir
+}
+
+func (s *Server) swapRuntime(store *accounts.Store, syncClient *cliproxy.Client, staticDir string) *accounts.Store {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	previous := s.store
+	s.store = store
+	s.syncClient = syncClient
+	s.staticDir = staticDir
+	return previous
+}
+
+func (s *Server) buildSyncClientFromConfig() *cliproxy.Client {
+	timeout := time.Duration(max(10, s.cfg.Sync.RequestTimeout)) * time.Second
+	return cliproxy.New(s.cfg.Sync.Enabled, s.cfg.Sync.BaseURL, s.cfg.Sync.ManagementKey, s.cfg.Sync.ProviderType, timeout, s.cfg.SyncProxyURL())
+}
+
+func (s *Server) getNewAPIClient() *newapi.Client {
+	key := newAPIClientCacheKey(s.cfg)
+	s.sourceClientMu.Lock()
+	defer s.sourceClientMu.Unlock()
+	if s.cachedNewAPIClient != nil && s.cachedNewAPIKey == key {
+		return s.cachedNewAPIClient
+	}
+	client := s.newAPIClientFactory(s.cfg)
+	s.cachedNewAPIClient = client
+	s.cachedNewAPIKey = key
+	return client
+}
+
+func (s *Server) getSub2APIClient() *sub2api.Client {
+	key := sub2APIClientCacheKey(s.cfg)
+	s.sourceClientMu.Lock()
+	defer s.sourceClientMu.Unlock()
+	if s.cachedSub2APIClient != nil && s.cachedSub2APIKey == key {
+		return s.cachedSub2APIClient
+	}
+	client := s.sub2apiClientFactory(s.cfg)
+	s.cachedSub2APIClient = client
+	s.cachedSub2APIKey = key
+	return client
+}
+
+func (s *Server) getAccountRefreshRun() *accountRefreshRunResult {
+	s.accountRefreshMu.RLock()
+	defer s.accountRefreshMu.RUnlock()
+	if s.accountRefreshRun == nil {
+		return nil
+	}
+	copy := *s.accountRefreshRun
+	return &copy
+}
+
+func (s *Server) setAccountRefreshRun(run *accountRefreshRunResult) {
+	s.accountRefreshMu.Lock()
+	defer s.accountRefreshMu.Unlock()
+	if run == nil {
+		s.accountRefreshRun = nil
+		return
+	}
+	copy := *run
+	s.accountRefreshRun = &copy
+}
+
+func (s *Server) finishAccountRefreshRun(run *accountRefreshRunResult) {
+	if run == nil {
+		return
+	}
+	run.Running = false
+	run.Current = ""
+	run.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+	run.UpdatedAt = run.FinishedAt
+	s.setAccountRefreshRun(run)
+}
+
+func newAPIClientCacheKey(cfg *config.Config) string {
+	values := []string{
+		cfg.NewAPI.BaseURL,
+		cfg.NewAPI.Username,
+		cfg.NewAPI.Password,
+		cfg.NewAPI.AccessToken,
+		strconv.Itoa(cfg.NewAPI.UserID),
+		cfg.NewAPI.SessionCookie,
+		strconv.Itoa(cfg.NewAPI.RequestTimeout),
+		cfg.SyncProxyURL(),
+	}
+	return strings.Join(values, "\x00")
+}
+
+func sub2APIClientCacheKey(cfg *config.Config) string {
+	values := []string{
+		cfg.Sub2API.BaseURL,
+		cfg.Sub2API.Email,
+		cfg.Sub2API.Password,
+		cfg.Sub2API.APIKey,
+		cfg.Sub2API.GroupID,
+		strconv.Itoa(cfg.Sub2API.RequestTimeout),
+		cfg.SyncProxyURL(),
+	}
+	return strings.Join(values, "\x00")
+}
+
+func (s *Server) reloadRuntimeDependencies(previous configPayload) error {
+	nextStaticDir := s.cfg.ResolvePath(s.cfg.Server.StaticDir)
+	nextSyncClient := s.buildSyncClientFromConfig()
+	currentStore := s.getStore()
+	nextStore := currentStore
+
+	if storageSettingsChanged(previous, s.buildConfigPayload()) {
+		reloadedStore, err := accounts.NewStore(s.cfg)
+		if err != nil {
+			return err
+		}
+		snapshot, err := currentStore.Snapshot()
+		if err != nil {
+			_ = reloadedStore.Close()
+			return err
+		}
+		if err := reloadedStore.ReplaceAllData(snapshot); err != nil {
+			_ = reloadedStore.Close()
+			return err
+		}
+		nextStore = reloadedStore
+	}
+	if err := s.migrateImageFilesIfNeeded(previous, s.buildConfigPayload()); err != nil {
+		if nextStore != currentStore && nextStore != nil {
+			_ = nextStore.Close()
+		}
+		return err
+	}
+
+	previousStore := s.swapRuntime(nextStore, nextSyncClient, nextStaticDir)
+	if previousStore != nil && previousStore != nextStore {
+		_ = previousStore.Close()
+	}
+	return nil
+}
+
+func (s *Server) migrateImageFilesIfNeeded(previous, next configPayload) error {
+	oldDir := s.cfg.ResolvePath(previous.Storage.ImageDir)
+	newDir := s.cfg.ResolvePath(next.Storage.ImageDir)
+	if strings.EqualFold(filepath.Clean(oldDir), filepath.Clean(newDir)) {
+		return nil
+	}
+	info, err := os.Stat(oldDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		return err
+	}
+	normalizedNewDir := filepath.Clean(newDir)
+	return filepath.Walk(oldDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			if strings.HasPrefix(filepath.Clean(path)+string(os.PathSeparator), normalizedNewDir+string(os.PathSeparator)) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(oldDir, path)
+		if err != nil {
+			return err
+		}
+		targetPath := filepath.Join(newDir, rel)
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			return err
+		}
+		if _, err := os.Stat(targetPath); err == nil {
+			return os.Remove(path)
+		}
+		if err := os.Rename(path, targetPath); err == nil {
+			return nil
+		}
+		if err := copyFile(path, targetPath); err != nil {
+			return err
+		}
+		return os.Remove(path)
+	})
+}
+
+func copyFile(sourcePath, targetPath string) error {
+	sourceFile, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	targetFile, err := os.Create(targetPath)
+	if err != nil {
+		return err
+	}
+	defer targetFile.Close()
+
+	if _, err := io.Copy(targetFile, sourceFile); err != nil {
+		return err
+	}
+	return nil
+}
+
+func storageSettingsChanged(previous, next configPayload) bool {
+	return previous.Storage.Backend != next.Storage.Backend ||
+		previous.Storage.ConfigBackend != next.Storage.ConfigBackend ||
+		previous.Storage.AuthDir != next.Storage.AuthDir ||
+		previous.Storage.StateFile != next.Storage.StateFile ||
+		previous.Storage.SyncStateDir != next.Storage.SyncStateDir ||
+		previous.Storage.SQLitePath != next.Storage.SQLitePath ||
+		previous.Storage.ImageDir != next.Storage.ImageDir ||
+		previous.Storage.ImageStorage != next.Storage.ImageStorage ||
+		previous.Storage.ImageConversationStorage != next.Storage.ImageConversationStorage ||
+		previous.Storage.ImageDataStorage != next.Storage.ImageDataStorage ||
+		previous.Storage.RedisAddr != next.Storage.RedisAddr ||
+		previous.Storage.RedisPassword != next.Storage.RedisPassword ||
+		previous.Storage.RedisDB != next.Storage.RedisDB ||
+		previous.Storage.RedisPrefix != next.Storage.RedisPrefix ||
+		previous.Sync.ProviderType != next.Sync.ProviderType
 }
 
 func (s *Server) Handler() http.Handler {
@@ -60,27 +394,52 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /version", http.HandlerFunc(s.handleVersion))
 	mux.Handle("GET /health", http.HandlerFunc(handleHealth))
 
+	mux.Handle("POST /portal/api/register", http.HandlerFunc(s.handlePortalRegister))
+	mux.Handle("POST /portal/api/register/code", http.HandlerFunc(s.handlePortalRegisterCode))
+	mux.Handle("POST /portal/api/login", http.HandlerFunc(s.handlePortalLogin))
+	mux.Handle("POST /portal/api/logout", s.requirePortalUser(http.HandlerFunc(s.handlePortalLogout)))
+	mux.Handle("GET /portal/api/me", s.requirePortalUser(http.HandlerFunc(s.handlePortalMe)))
+	mux.Handle("GET /portal/api/workspace/bootstrap", s.requirePortalUser(http.HandlerFunc(s.handlePortalWorkspaceBootstrap)))
+	mux.Handle("GET /portal/api/workspace/accounts/{id}/quota", s.requirePortalUser(http.HandlerFunc(s.handlePortalAccountQuota)))
+	mux.Handle("GET /portal/api/admin/users", s.requirePortalAdmin(http.HandlerFunc(s.handlePortalAdminUsers)))
+	mux.Handle("PATCH /portal/api/admin/users/{id}", s.requirePortalAdmin(http.HandlerFunc(s.handlePortalAdminUpdateUser)))
+
 	mux.Handle("GET /api/accounts", s.requireUIAuth(http.HandlerFunc(s.handleListAccounts)))
 	mux.Handle("GET /api/accounts/{id}/quota", s.requireUIAuth(http.HandlerFunc(s.handleAccountQuota)))
 	mux.Handle("POST /api/accounts", s.requireUIAuth(http.HandlerFunc(s.handleCreateAccounts)))
 	mux.Handle("POST /api/accounts/import", s.requireUIAuth(http.HandlerFunc(s.handleImportAccounts)))
 	mux.Handle("DELETE /api/accounts", s.requireUIAuth(http.HandlerFunc(s.handleDeleteAccounts)))
 	mux.Handle("POST /api/accounts/refresh", s.requireUIAuth(http.HandlerFunc(s.handleRefreshAccounts)))
+	mux.Handle("POST /api/accounts/refresh-all", s.requireUIAuth(http.HandlerFunc(s.handleRefreshAllAccounts)))
+	mux.Handle("GET /api/accounts/refresh-progress", s.requireUIAuth(http.HandlerFunc(s.handleAccountRefreshProgress)))
 	mux.Handle("POST /api/accounts/update", s.requireUIAuth(http.HandlerFunc(s.handleUpdateAccount)))
 	mux.Handle("GET /api/config", s.requireUIAuth(http.HandlerFunc(s.handleGetConfig)))
 	mux.Handle("GET /api/config/defaults", s.requireUIAuth(http.HandlerFunc(s.handleGetDefaultConfig)))
 	mux.Handle("PUT /api/config", s.requireUIAuth(http.HandlerFunc(s.handleUpdateConfig)))
+	mux.Handle("POST /api/proxy/test", s.requireUIAuth(http.HandlerFunc(s.handleProxyTest)))
+	mux.Handle("POST /api/integration/test", s.requireUIAuth(http.HandlerFunc(s.handleIntegrationTest)))
+	mux.Handle("POST /api/integration/newapi/token", s.requireUIAuth(http.HandlerFunc(s.handleNewAPITokenDiscover)))
+	mux.Handle("POST /api/integration/sub2api/groups", s.requireUIAuth(http.HandlerFunc(s.handleSub2APIGroups)))
 	mux.Handle("GET /api/requests", s.requireUIAuth(http.HandlerFunc(s.handleListRequestLogs)))
+	mux.Handle("GET /api/startup/check", s.requireUIAuth(http.HandlerFunc(s.handleStartupCheck)))
+	mux.Handle("GET /api/runtime/status", s.requireUIAuth(http.HandlerFunc(s.handleRuntimeStatus)))
+	mux.Handle("GET /api/diagnostics/export", s.requireUIAuth(http.HandlerFunc(s.handleExportDiagnostics)))
+	mux.Handle("POST /api/tools/admission-stress", s.requireUIAuth(http.HandlerFunc(s.handleAdmissionStress)))
 	mux.Handle("GET /api/sync/status", s.requireUIAuth(http.HandlerFunc(s.handleSyncStatus)))
 	mux.Handle("POST /api/sync/run", s.requireUIAuth(http.HandlerFunc(s.handleRunSync)))
+	mux.Handle("GET /api/image/conversations", s.requireUIAuth(http.HandlerFunc(s.handleListImageConversations)))
+	mux.Handle("DELETE /api/image/conversations", s.requireUIAuth(http.HandlerFunc(s.handleClearImageConversations)))
+	mux.Handle("POST /api/image/conversations/import", s.requireUIAuth(http.HandlerFunc(s.handleImportImageConversations)))
+	mux.Handle("GET /api/image/conversations/{id}", s.requireUIAuth(http.HandlerFunc(s.handleGetImageConversation)))
+	mux.Handle("PUT /api/image/conversations/{id}", s.requireUIAuth(http.HandlerFunc(s.handleSaveImageConversation)))
+	mux.Handle("DELETE /api/image/conversations/{id}", s.requireUIAuth(http.HandlerFunc(s.handleDeleteImageConversation)))
 
 	mux.Handle("POST /v1/images/generations", s.requireImageAuth(http.HandlerFunc(s.handleImageGenerations)))
 	mux.Handle("POST /v1/images/edits", s.requireImageAuth(http.HandlerFunc(s.handleImageEdits)))
-	mux.Handle("POST /v1/images/upscale", s.requireImageAuth(http.HandlerFunc(s.handleImageUpscale)))
 	mux.Handle("POST /v1/chat/completions", s.requireImageAuth(http.HandlerFunc(s.handleImageChatCompletions)))
 	mux.Handle("POST /v1/responses", s.requireImageAuth(http.HandlerFunc(s.handleImageResponses)))
 	mux.Handle("GET /v1/models", s.requireImageAuth(http.HandlerFunc(s.handleModels)))
-	mux.Handle("GET /v1/files/image/", handleImageFile())
+	mux.Handle("GET /v1/files/image/", http.HandlerFunc(s.handleImageFile))
 
 	mux.Handle("/", http.HandlerFunc(s.handleWebApp))
 
@@ -108,7 +467,8 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
-	items, err := s.store.ListAccounts()
+	store := s.getStore()
+	items, err := store.ListAccounts()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -117,6 +477,7 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAccountQuota(w http.ResponseWriter, r *http.Request) {
+	store := s.getStore()
 	accountID := strings.TrimSpace(r.PathValue("id"))
 	if accountID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "account id is required"})
@@ -133,7 +494,7 @@ func (s *Server) handleAccountQuota(w http.ResponseWriter, r *http.Request) {
 	refreshed := false
 	refreshError := ""
 	if refreshRequested {
-		_, refreshErrors, refreshErr := s.store.RefreshAccounts(r.Context(), []string{account.AccessToken})
+		_, refreshErrors, refreshErr := store.RefreshAccounts(r.Context(), []string{account.AccessToken})
 		if refreshErr != nil {
 			refreshError = refreshErr.Error()
 		}
@@ -141,7 +502,7 @@ func (s *Server) handleAccountQuota(w http.ResponseWriter, r *http.Request) {
 			refreshError = firstNonEmpty(refreshErrors[0].Error, refreshError)
 		}
 		if refreshError == "" {
-			if updated, updatedErr := s.store.GetAccountByToken(account.AccessToken); updatedErr == nil && updated != nil {
+			if updated, updatedErr := store.GetAccountByToken(account.AccessToken); updatedErr == nil && updated != nil {
 				account = *updated
 			}
 			refreshed = true
@@ -164,6 +525,11 @@ func (s *Server) handleAccountQuota(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateAccounts(w http.ResponseWriter, r *http.Request) {
+	store := s.getStore()
+	if s.configuredImageMode() != "studio" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "导入 Token 仅支持 Studio 模式"})
+		return
+	}
 	var body struct {
 		Tokens []string `json:"tokens"`
 	}
@@ -175,18 +541,18 @@ func (s *Server) handleCreateAccounts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "tokens is required"})
 		return
 	}
-	added, skipped, err := s.store.AddAccounts(body.Tokens)
+	added, skipped, err := store.AddAccounts(body.Tokens)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 
-	refreshed, refreshErrors, err := s.store.RefreshAccounts(r.Context(), body.Tokens)
+	refreshed, refreshErrors, err := store.RefreshAccounts(r.Context(), body.Tokens)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	items, err := s.store.ListAccounts()
+	items, err := store.ListAccounts()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -202,6 +568,7 @@ func (s *Server) handleCreateAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleImportAccounts(w http.ResponseWriter, r *http.Request) {
+	store := s.getStore()
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart form"})
 		return
@@ -217,7 +584,7 @@ func (s *Server) handleImportAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	imported, importedTokens, skipped, importFailures, err := s.store.ImportAuthFiles(files)
+	imported, importedTokens, skipped, importFailures, err := store.ImportAuthFiles(files)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -226,14 +593,14 @@ func (s *Server) handleImportAccounts(w http.ResponseWriter, r *http.Request) {
 	refreshed := 0
 	refreshErrors := []accounts.RefreshError{}
 	if len(importedTokens) > 0 {
-		refreshed, refreshErrors, err = s.store.RefreshAccounts(r.Context(), importedTokens)
+		refreshed, refreshErrors, err = store.RefreshAccounts(r.Context(), importedTokens)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
 	}
 
-	items, err := s.store.ListAccounts()
+	items, err := store.ListAccounts()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -255,6 +622,7 @@ func (s *Server) handleImportAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteAccounts(w http.ResponseWriter, r *http.Request) {
+	store := s.getStore()
 	var body struct {
 		Tokens []string `json:"tokens"`
 	}
@@ -263,12 +631,12 @@ func (s *Server) handleDeleteAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	removed, err := s.store.DeleteAccounts(body.Tokens)
+	removed, err := store.DeleteAccounts(body.Tokens)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	items, err := s.store.ListAccounts()
+	items, err := store.ListAccounts()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -278,6 +646,7 @@ func (s *Server) handleDeleteAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRefreshAccounts(w http.ResponseWriter, r *http.Request) {
+	store := s.getStore()
 	var body struct {
 		AccessTokens []string `json:"access_tokens"`
 	}
@@ -286,12 +655,12 @@ func (s *Server) handleRefreshAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	refreshed, refreshErrors, err := s.store.RefreshAccounts(r.Context(), body.AccessTokens)
+	refreshed, refreshErrors, err := store.RefreshAccounts(r.Context(), body.AccessTokens)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	items, err := s.store.ListAccounts()
+	items, err := store.ListAccounts()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -304,7 +673,76 @@ func (s *Server) handleRefreshAccounts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleRefreshAllAccounts(w http.ResponseWriter, r *http.Request) {
+	if current := s.getAccountRefreshRun(); current != nil && current.Running {
+		writeJSON(w, http.StatusOK, map[string]any{"progress": current, "alreadyRunning": true})
+		return
+	}
+
+	items, err := s.getStore().ListAccounts()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	tokens := make([]string, 0, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.AccessToken) == "" {
+			continue
+		}
+		tokens = append(tokens, item.AccessToken)
+	}
+
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	run := &accountRefreshRunResult{
+		OK:        true,
+		Running:   true,
+		Total:     len(tokens),
+		StartedAt: startedAt,
+		UpdatedAt: startedAt,
+	}
+	s.setAccountRefreshRun(run)
+
+	if len(tokens) == 0 {
+		s.finishAccountRefreshRun(run)
+		writeJSON(w, http.StatusOK, map[string]any{"progress": run})
+		return
+	}
+
+	store := s.getStore()
+	go func(tokens []string) {
+		refreshed, refreshErrors, refreshErr := store.RefreshAccountsWithOptions(context.Background(), tokens, accounts.RefreshOptions{
+			MaxWorkers: maxBulkAccountRefreshWorkers,
+			Progress: func(progress accounts.RefreshProgress) {
+				run.Refreshed = progress.Refreshed
+				run.Failed = progress.Failed
+				run.Processed = progress.Processed
+				run.Current = progress.Current
+				run.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+				s.setAccountRefreshRun(run)
+			},
+		})
+		if refreshErr != nil {
+			run.OK = false
+			run.Error = refreshErr.Error()
+		} else if len(refreshErrors) > 0 {
+			run.OK = false
+			run.Error = firstNonEmpty(refreshErrors[0].Error, "")
+		}
+		run.Refreshed = refreshed
+		run.Failed = len(refreshErrors)
+		run.Processed = len(tokens)
+		s.finishAccountRefreshRun(run)
+	}(append([]string(nil), tokens...))
+
+	writeJSON(w, http.StatusOK, map[string]any{"progress": run})
+}
+
+func (s *Server) handleAccountRefreshProgress(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"progress": s.getAccountRefreshRun()})
+}
+
 func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
+	store := s.getStore()
 	var body struct {
 		AccessToken string `json:"access_token"`
 		Type        string `json:"type"`
@@ -331,7 +769,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		update.Note = &body.Note
 	}
 
-	item, err := s.store.UpdateAccount(body.AccessToken, update)
+	item, err := store.UpdateAccount(body.AccessToken, update)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -340,7 +778,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]any{"error": err.Error()})
 		return
 	}
-	items, err := s.store.ListAccounts()
+	items, err := store.ListAccounts()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -350,7 +788,13 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
-	status, err := s.store.SyncStatus(r.Context(), s.syncClient)
+	source := firstNonEmpty(r.URL.Query().Get("source"), "cpa")
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("progress_only")), "1") ||
+		strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("progress_only")), "true") {
+		writeJSON(w, http.StatusOK, buildSourceSyncProgressStatus(source, s.getSourceSyncRun(normalizeSyncSource(source))))
+		return
+	}
+	status, err := s.buildSourceSyncStatus(r.Context(), source)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -360,17 +804,19 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRunSync(w http.ResponseWriter, r *http.Request) {
 	var body struct {
+		Source    string `json:"source"`
 		Direction string `json:"direction"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
-	result, err := s.store.RunSync(r.Context(), s.syncClient, body.Direction)
+	source := firstNonEmpty(body.Source, r.URL.Query().Get("source"), "cpa")
+	result, err := s.runSourceSync(r.Context(), source, body.Direction)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	status, statusErr := s.store.SyncStatus(r.Context(), s.syncClient)
+	status, statusErr := s.buildSourceSyncStatus(r.Context(), source)
 	if statusErr != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"result": result})
 		return
@@ -399,6 +845,7 @@ func (s *Server) handleImageGenerations(w http.ResponseWriter, r *http.Request) 
 	if req.N < 1 {
 		req.N = 1
 	}
+	req.ResponseFormat = s.normalizeThirdPartyImageResponseFormat(r, req.ResponseFormat)
 
 	payload, err := s.executeImageGeneration(r.Context(), imageGenerationRequest{
 		Model:          req.Model,
@@ -416,6 +863,17 @@ func (s *Server) handleImageGenerations(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, payload)
 }
 
+func (s *Server) normalizeThirdPartyImageResponseFormat(r *http.Request, requested string) string {
+	responseFormat := strings.TrimSpace(requested)
+	if responseFormat != "" && !strings.EqualFold(responseFormat, "url") {
+		return responseFormat
+	}
+	if s.isThirdPartyImageAPIRequest(r) {
+		return "b64_json"
+	}
+	return responseFormat
+}
+
 func (s *Server) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(int64(max(1, s.cfg.App.MaxUploadSizeMB)) << 20); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart form"})
@@ -429,6 +887,8 @@ func (s *Server) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	}
 	requestedModel := normalizeRequestedImageModel(r.FormValue("model"), s.cfg.ChatGPT.Model)
 	responseFormat := firstNonEmpty(r.FormValue("response_format"), s.cfg.App.ImageFormat, "url")
+	size := strings.TrimSpace(r.FormValue("size"))
+	quality := strings.TrimSpace(r.FormValue("quality"))
 	mask, err := readOptionalMultipartFile(r.MultipartForm, "mask")
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -442,7 +902,7 @@ func (s *Server) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "mask is required for selection edit"})
 			return
 		}
-		data, err = s.withImageResults(r.Context(), "selection-edit", responseFormat, inpaintRequest.sourceAccountID, requestedModel, false, func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
+		data, err = s.withImageResultsWithMetadata(r.Context(), "selection-edit", responseFormat, inpaintRequest.sourceAccountID, requestedModel, false, newImageRequestMetadata(prompt, "", ""), func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
 			return client.InpaintImageByMask(
 				r.Context(),
 				prompt,
@@ -470,6 +930,8 @@ func (s *Server) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 			Prompt:         prompt,
 			Images:         images,
 			Mask:           mask,
+			Size:           size,
+			Quality:        quality,
 			ResponseFormat: responseFormat,
 		}, r)
 		if execErr != nil {
@@ -485,68 +947,99 @@ func (s *Server) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
 }
 
-func (s *Server) handleImageUpscale(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(int64(max(1, s.cfg.App.MaxUploadSizeMB)) << 20); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart form"})
-		return
-	}
+type imageRequestMetadata struct {
+	size         string
+	quality      string
+	promptLength int
+}
 
-	images, err := readImagesFromMultipart(r.MultipartForm)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+func (m imageRequestMetadata) applyTo(entry *imageRequestLogEntry) {
+	if entry == nil {
 		return
 	}
-	if len(images) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "at least one image is required"})
-		return
-	}
+	entry.Size = strings.TrimSpace(m.size)
+	entry.Quality = strings.TrimSpace(m.quality)
+	entry.PromptLength = m.promptLength
+}
 
-	scale := firstNonEmpty(r.FormValue("scale"), "2x")
-	extraPrompt := strings.TrimSpace(r.FormValue("prompt"))
-	prompt := fmt.Sprintf("Upscale and enhance this image to %s. Preserve composition, identity, colors, and style while improving sharpness, clarity, and fine detail.", scale)
-	if extraPrompt != "" {
-		prompt += " " + extraPrompt
+func newImageRequestMetadata(prompt, size, quality string) imageRequestMetadata {
+	return imageRequestMetadata{
+		size:         strings.TrimSpace(size),
+		quality:      strings.TrimSpace(quality),
+		promptLength: len([]rune(strings.TrimSpace(prompt))),
 	}
-	requestedModel := normalizeRequestedImageModel(r.FormValue("model"), s.cfg.ChatGPT.Model)
-	responseFormat := firstNonEmpty(r.FormValue("response_format"), s.cfg.App.ImageFormat, "url")
-
-	data, err := s.withImageResults(r.Context(), "upscale", responseFormat, "", requestedModel, handler.SupportsResponsesInlineEdit([][]byte{images[0]}, nil), func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
-		return client.EditImageByUpload(r.Context(), prompt, upstreamModel, [][]byte{images[0]}, nil)
-	}, r)
-	if err != nil {
-		writeImageRequestError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
 }
 
 func (s *Server) withImageResults(ctx context.Context, operation, responseFormat, preferredAccountID, requestedModel string, responsesEligible bool, run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error), r *http.Request) ([]map[string]any, error) {
+	return s.withImageResultsWithMetadata(ctx, operation, responseFormat, preferredAccountID, requestedModel, responsesEligible, imageRequestMetadata{}, run, r)
+}
+
+func (s *Server) withImageResultsWithMetadata(ctx context.Context, operation, responseFormat, preferredAccountID, requestedModel string, responsesEligible bool, metadata imageRequestMetadata, run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error), r *http.Request) ([]map[string]any, error) {
+	return s.withImageResultsFilteredWithMetadata(ctx, operation, responseFormat, preferredAccountID, requestedModel, responsesEligible, nil, metadata, run, r)
+}
+
+func (s *Server) withImageResultsFiltered(
+	ctx context.Context,
+	operation, responseFormat, preferredAccountID, requestedModel string,
+	responsesEligible bool,
+	allowAccount func(accounts.PublicAccount) bool,
+	run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error),
+	r *http.Request,
+) ([]map[string]any, error) {
+	return s.withImageResultsFilteredWithMetadata(ctx, operation, responseFormat, preferredAccountID, requestedModel, responsesEligible, allowAccount, imageRequestMetadata{}, run, r)
+}
+
+func (s *Server) withImageResultsFilteredWithMetadata(
+	ctx context.Context,
+	operation, responseFormat, preferredAccountID, requestedModel string,
+	responsesEligible bool,
+	allowAccount func(accounts.PublicAccount) bool,
+	metadata imageRequestMetadata,
+	run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error),
+	r *http.Request,
+) ([]map[string]any, error) {
+	store := s.getStore()
 	mode := s.configuredImageMode()
 	if mode == "cpa" {
-		return s.runPureCPAImageRequest(ctx, operation, responseFormat, requestedModel, strings.TrimSpace(preferredAccountID) != "", run, r)
+		return s.runPureCPAImageRequest(ctx, operation, responseFormat, requestedModel, strings.TrimSpace(preferredAccountID) != "", metadata, run, r)
+	}
+	policy, err := parseRequestImageAccountRoutingPolicy(r)
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(preferredAccountID) != "" {
-		authFile, account, err := s.store.FindImageAuthByID(preferredAccountID)
+		authFile, account, releaseLease, err := store.FindImageAuthByIDWithLease(preferredAccountID)
 		if err != nil {
 			if errors.Is(err, accounts.ErrSourceAccountNotFound) {
 				return nil, newRequestError("source_account_not_found", "原始图片所属账号不存在，请使用普通编辑重试")
 			}
 			return nil, err
 		}
-		data, _, err := s.runImageRequest(ctx, authFile, account, operation, responseFormat, true, requestedModel, responsesEligible, run, r)
+		data, _, err := s.runImageRequest(ctx, authFile, account, releaseLease, accounts.ImageAccountRoutingDecision{}, operation, responseFormat, true, requestedModel, responsesEligible, metadata, run, r)
 		return data, err
 	}
 
 	attempted := map[string]struct{}{}
 	var lastRetryableErr error
 	for {
-		authFile, account, err := s.store.AcquireImageAuthFiltered(attempted, nil)
+		var (
+			authFile     *accounts.LocalAuth
+			account      accounts.PublicAccount
+			releaseLease func()
+			decision     accounts.ImageAccountRoutingDecision
+			err          error
+		)
+		if policy != nil {
+			authFile, account, decision, releaseLease, err = store.AcquireImageAuthLeaseWithPolicyFilteredWithDisabledOption(attempted, allowAccount, s.allowDisabledStudioImageAccounts(), policy)
+		} else {
+			authFile, account, releaseLease, err = store.AcquireImageAuthLeaseFilteredWithDisabledOption(attempted, allowAccount, s.allowDisabledStudioImageAccounts())
+		}
 		if err != nil {
 			return nil, resolveImageAcquireError(mode, err, lastRetryableErr)
 		}
 		attempted[authFile.AccessToken] = struct{}{}
 
-		data, retryable, err := s.runImageRequest(ctx, authFile, account, operation, responseFormat, false, requestedModel, responsesEligible, run, r)
+		data, retryable, err := s.runImageRequest(ctx, authFile, account, releaseLease, decision, operation, responseFormat, false, requestedModel, responsesEligible, metadata, run, r)
 		if retryable && len(attempted) < 64 {
 			lastRetryableErr = err
 			continue
@@ -555,7 +1048,52 @@ func (s *Server) withImageResults(ctx context.Context, operation, responseFormat
 	}
 }
 
+func (s *Server) newOfficialWorkflowClient(accessToken string, authData map[string]any) imageWorkflowClient {
+	if s != nil && s.officialClientFactory != nil {
+		return s.officialClientFactory(accessToken, s.cfg.ChatGPTProxyURL(), authData, s.imageRequestConfig())
+	}
+	return handler.NewChatGPTClientWithProxyAndConfig(
+		accessToken,
+		firstNonEmpty(stringValue(authData["cookies"]), stringValue(authData["cookie"])),
+		s.cfg.ChatGPTProxyURL(),
+		s.imageRequestConfig(),
+	)
+}
+
+func (s *Server) newResponsesWorkflowClient(accessToken string, authData map[string]any) imageWorkflowClient {
+	if s != nil && s.responsesClientFactory != nil {
+		return s.responsesClientFactory(accessToken, s.cfg.ChatGPTProxyURL(), authData, s.imageRequestConfig())
+	}
+	return handler.NewResponsesClientWithProxyAndConfig(
+		accessToken,
+		s.cfg.ChatGPTProxyURL(),
+		authData,
+		s.imageRequestConfig(),
+	)
+}
+
+func (s *Server) newCPAWorkflowClient() cpaRouteAwareImageWorkflowClient {
+	timeout := time.Duration(max(10, s.cfg.CPAImageRequestTimeout())) * time.Second
+	if s != nil && s.cpaClientFactory != nil {
+		return s.cpaClientFactory(
+			s.cfg.CPAImageBaseURL(),
+			s.cfg.CPAImageAPIKey(),
+			timeout,
+			s.cfg.CPAImageRouteStrategy(),
+		)
+	}
+	return newCPAImageClient(
+		s.cfg.CPAImageBaseURL(),
+		s.cfg.CPAImageAPIKey(),
+		timeout,
+		s.cfg.CPAImageRouteStrategy(),
+	)
+}
+
 func resolveImageAcquireError(mode string, err, lastRetryableErr error) error {
+	if errors.Is(err, accounts.ErrSelectedImageGroupsExhausted) {
+		return newRequestError("selected_image_groups_exhausted", "当前选中的图片账号分组已经全部用尽，请调整分组或稍后重试")
+	}
 	if !errors.Is(err, accounts.ErrNoAvailableImageAuth) {
 		return err
 	}
@@ -574,13 +1112,14 @@ func (s *Server) runPureCPAImageRequest(
 	responseFormat string,
 	requestedModel string,
 	preferredAccount bool,
+	metadata imageRequestMetadata,
 	run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error),
 	r *http.Request,
 ) ([]map[string]any, error) {
 	startedAt := time.Now()
 	if !s.cfg.CPAImageConfigured() {
 		err := newRequestError("cpa_image_not_configured", "CPA 图片接口还未配置，请先在配置管理中设置 CPA base_url 与 api_key")
-		s.logImageRequest(imageRequestLogEntry{
+		entry := imageRequestLogEntry{
 			StartedAt:      startedAt.Format(time.RFC3339Nano),
 			FinishedAt:     time.Now().Format(time.RFC3339Nano),
 			Endpoint:       r.URL.Path,
@@ -588,62 +1127,119 @@ func (s *Server) runPureCPAImageRequest(
 			ImageMode:      "cpa",
 			Direction:      "cpa",
 			Route:          "cpa",
+			CPASubroute:    s.cfg.CPAImageRouteStrategy(),
 			RequestedModel: requestedModel,
 			Preferred:      preferredAccount,
 			Success:        false,
 			Error:          err.Error(),
-		})
+		}
+		metadata.applyTo(&entry)
+		s.logImageRequest(entry)
 		return nil, err
 	}
 
-	client := newCPAImageClient(
-		s.cfg.CPAImageBaseURL(),
-		s.cfg.CPAImageAPIKey(),
-		time.Duration(max(10, s.cfg.CPAImageRequestTimeout()))*time.Second,
-	)
+	admissionInfo, releaseAdmission, admissionErr := s.acquireImageAdmission(ctx)
+	if admissionErr != nil {
+		err := admissionErr
+		if errors.Is(admissionErr, errImageAdmissionQueueFull) {
+			err = newRequestError("image_queue_full", "当前图片请求排队已满，请稍后再试")
+		} else if errors.Is(admissionErr, errImageAdmissionQueueTimeout) {
+			err = newRequestError("image_queue_timeout", "当前图片请求排队超时，请稍后再试")
+		}
+		entry := imageRequestLogEntry{
+			StartedAt:            startedAt.Format(time.RFC3339Nano),
+			FinishedAt:           time.Now().Format(time.RFC3339Nano),
+			Endpoint:             r.URL.Path,
+			Operation:            operation,
+			ImageMode:            "cpa",
+			Direction:            "cpa",
+			Route:                "cpa",
+			CPASubroute:          s.cfg.CPAImageRouteStrategy(),
+			RequestedModel:       requestedModel,
+			Preferred:            preferredAccount,
+			Success:              false,
+			Error:                err.Error(),
+			QueueWaitMS:          admissionInfo.QueueWaitMS,
+			InflightCountAtStart: admissionInfo.InflightCountAtStart,
+		}
+		if requestErr, ok := err.(*requestError); ok {
+			entry.ErrorCode = requestErr.code
+		}
+		metadata.applyTo(&entry)
+		s.logImageRequest(entry)
+		return nil, err
+	}
+	defer releaseAdmission()
+	ctx = withImageAdmissionInfo(ctx, admissionInfo)
+
+	client := s.newCPAWorkflowClient()
 	upstreamModel := cpaFixedImageModel
 	results, err := run(client, upstreamModel)
+	cpaSubroute := client.LastRoute()
+	if label := strings.TrimSpace(client.LastModelLabel()); label != "" {
+		upstreamModel = label
+	}
 	if err != nil {
-		s.logImageRequest(imageRequestLogEntry{
-			StartedAt:      startedAt.Format(time.RFC3339Nano),
-			FinishedAt:     time.Now().Format(time.RFC3339Nano),
-			Endpoint:       r.URL.Path,
-			Operation:      operation,
-			ImageMode:      "cpa",
-			Direction:      "cpa",
-			Route:          "cpa",
-			RequestedModel: requestedModel,
-			UpstreamModel:  upstreamModel,
-			Preferred:      preferredAccount,
-			Success:        false,
-			Error:          err.Error(),
-		})
+		admissionInfo := imageAdmissionFromContext(ctx)
+		entry := imageRequestLogEntry{
+			StartedAt:            startedAt.Format(time.RFC3339Nano),
+			FinishedAt:           time.Now().Format(time.RFC3339Nano),
+			Endpoint:             r.URL.Path,
+			Operation:            operation,
+			ImageMode:            "cpa",
+			Direction:            "cpa",
+			Route:                "cpa",
+			CPASubroute:          cpaSubroute,
+			RequestedModel:       requestedModel,
+			UpstreamModel:        upstreamModel,
+			Preferred:            preferredAccount,
+			Success:              false,
+			Error:                err.Error(),
+			QueueWaitMS:          admissionInfo.QueueWaitMS,
+			InflightCountAtStart: admissionInfo.InflightCountAtStart,
+		}
+		if requestErr, ok := err.(*requestError); ok {
+			entry.ErrorCode = requestErr.code
+		}
+		metadata.applyTo(&entry)
+		s.logImageRequest(entry)
 		return nil, err
 	}
 
-	s.logImageRequest(imageRequestLogEntry{
-		StartedAt:      startedAt.Format(time.RFC3339Nano),
-		FinishedAt:     time.Now().Format(time.RFC3339Nano),
-		Endpoint:       r.URL.Path,
-		Operation:      operation,
-		ImageMode:      "cpa",
-		Direction:      "cpa",
-		Route:          "cpa",
-		RequestedModel: requestedModel,
-		UpstreamModel:  upstreamModel,
-		Preferred:      preferredAccount,
-		Success:        true,
-	})
-	return buildImageResponse(r, client, results, responseFormat, ""), nil
+	admissionInfo = imageAdmissionFromContext(ctx)
+	entry := imageRequestLogEntry{
+		StartedAt:            startedAt.Format(time.RFC3339Nano),
+		FinishedAt:           time.Now().Format(time.RFC3339Nano),
+		Endpoint:             r.URL.Path,
+		Operation:            operation,
+		ImageMode:            "cpa",
+		Direction:            "cpa",
+		Route:                "cpa",
+		CPASubroute:          cpaSubroute,
+		RequestedModel:       requestedModel,
+		UpstreamModel:        upstreamModel,
+		Preferred:            preferredAccount,
+		Success:              true,
+		QueueWaitMS:          admissionInfo.QueueWaitMS,
+		InflightCountAtStart: admissionInfo.InflightCountAtStart,
+	}
+	metadata.applyTo(&entry)
+	s.logImageRequest(entry)
+	return buildImageResponse(r, client, results, responseFormat, "", s.cfg.ResolvePath(s.cfg.Storage.ImageDir)), nil
 }
 
-func (s *Server) runImageRequest(ctx context.Context, authFile *accounts.LocalAuth, account accounts.PublicAccount, operation, responseFormat string, preferredAccount bool, requestedModel string, responsesEligible bool, run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error), r *http.Request) ([]map[string]any, bool, error) {
+func (s *Server) runImageRequest(ctx context.Context, authFile *accounts.LocalAuth, account accounts.PublicAccount, releaseLease func(), routingDecision accounts.ImageAccountRoutingDecision, operation, responseFormat string, preferredAccount bool, requestedModel string, responsesEligible bool, metadata imageRequestMetadata, run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error), r *http.Request) ([]map[string]any, bool, error) {
+	store := s.getStore()
+	if releaseLease != nil {
+		defer releaseLease()
+	}
 	startedAt := time.Now()
-	refreshRequired := accounts.NeedsImageQuotaRefresh(account, time.Now())
+	now := time.Now()
+	refreshRequired := account.SourceKind == accounts.AccountSourceKindToken || accounts.NeedsImageQuotaRefreshWithTTL(account, now, s.cfg.ImageQuotaRefreshTTL())
 	if refreshRequired {
-		_, refreshErrors, refreshErr := s.store.RefreshAccounts(ctx, []string{authFile.AccessToken})
+		_, refreshErrors, refreshErr := store.RefreshAccounts(ctx, []string{authFile.AccessToken})
 		if refreshErr == nil {
-			if refreshed, accountErr := s.store.GetAccountByToken(authFile.AccessToken); accountErr == nil && refreshed != nil {
+			if refreshed, accountErr := store.GetAccountByToken(authFile.AccessToken); accountErr == nil && refreshed != nil {
 				account = *refreshed
 			}
 		}
@@ -654,7 +1250,7 @@ func (s *Server) runImageRequest(ctx context.Context, authFile *accounts.LocalAu
 			return nil, true, refreshErr
 		}
 		if len(refreshErrors) > 0 && isInvalidRefreshError(refreshErrors[0].Error) {
-			s.store.MarkImageTokenAbnormal(authFile.AccessToken)
+			store.MarkImageTokenAbnormal(authFile.AccessToken)
 			if preferredAccount {
 				return nil, false, newRequestError("source_account_unavailable", "原始图片所属账号当前不可用，请使用普通编辑重试")
 			}
@@ -666,58 +1262,105 @@ func (s *Server) runImageRequest(ctx context.Context, authFile *accounts.LocalAu
 			}
 			return nil, true, errors.New(firstNonEmpty(refreshErrors[0].Error, "image account quota refresh failed"))
 		}
-		if !isImageAccountUsable(account) {
+		if !isImageAccountUsable(account, s.allowDisabledStudioImageAccounts()) {
 			if preferredAccount {
 				return nil, false, newRequestError("source_account_unavailable", "原始图片所属账号当前不可用，请使用普通编辑重试")
 			}
 			return nil, true, fmt.Errorf("image account is unavailable")
 		}
-	} else if !isImageAccountUsable(account) {
+	} else if !isImageAccountUsable(account, s.allowDisabledStudioImageAccounts()) {
 		if preferredAccount {
 			return nil, false, newRequestError("source_account_unavailable", "原始图片所属账号当前不可用，请使用普通编辑重试")
 		}
 		return nil, true, fmt.Errorf("image account is unavailable")
 	}
-	if preferredAccount && !isImageAccountUsable(account) {
+	if preferredAccount && !isImageAccountUsable(account, s.allowDisabledStudioImageAccounts()) {
 		return nil, false, newRequestError("source_account_unavailable", "原始图片所属账号当前不可用，请使用普通编辑重试")
+	}
+	if routingDecision.PolicyApplied && !store.ImageAccountAllowedForPolicy(authFile.AccessToken, account, &accounts.ImageAccountRoutingPolicy{
+		Enabled:        true,
+		SortMode:       routingDecision.SortMode,
+		ReservePercent: routingDecision.ReservePercent,
+		ReserveMode:    "daily_first_seen_percent",
+	}) {
+		return nil, true, newRequestError("image_account_reserved", "当前账号已触发分组保底阈值，正在切换下一个账号")
 	}
 
 	mode := s.configuredImageMode()
+	admissionInfo, releaseAdmission, admissionErr := s.acquireImageAdmission(ctx)
+	if admissionErr != nil {
+		err := admissionErr
+		if errors.Is(admissionErr, errImageAdmissionQueueFull) {
+			err = newRequestError("image_queue_full", "当前图片请求排队已满，请稍后再试")
+		} else if errors.Is(admissionErr, errImageAdmissionQueueTimeout) {
+			err = newRequestError("image_queue_timeout", "当前图片请求排队超时，请稍后再试")
+		}
+		entry := imageRequestLogEntry{
+			StartedAt:            startedAt.Format(time.RFC3339Nano),
+			FinishedAt:           time.Now().Format(time.RFC3339Nano),
+			Endpoint:             r.URL.Path,
+			Operation:            operation,
+			ImageMode:            mode,
+			AccountType:          account.Type,
+			AccountEmail:         account.Email,
+			AccountFile:          authFile.Name,
+			RequestedModel:       requestedModel,
+			Preferred:            preferredAccount,
+			Success:              false,
+			Error:                err.Error(),
+			LeaseAcquired:        releaseLease != nil,
+			QueueWaitMS:          admissionInfo.QueueWaitMS,
+			InflightCountAtStart: admissionInfo.InflightCountAtStart,
+		}
+		if requestErr, ok := err.(*requestError); ok {
+			entry.ErrorCode = requestErr.code
+		}
+		applyImageRoutingLogFields(routingDecision, &entry)
+		metadata.applyTo(&entry)
+		s.logImageRequest(entry)
+		return nil, false, err
+	}
+	defer releaseAdmission()
+	ctx = withImageAdmissionInfo(ctx, admissionInfo)
 	var (
-		client        imageWorkflowClient
-		upstreamModel string
-		route         string
-		direction     string
+		client         imageWorkflowClient
+		upstreamModel  string
+		route          string
+		direction      string
+		imageToolModel string
 	)
-	if shouldUseCPAImageRoute(mode, account.Type) {
+	if shouldUseCPAImageRoute(mode) {
 		if !s.cfg.CPAImageConfigured() {
 			err := newRequestError("cpa_image_not_configured", "CPA 图片接口还未配置，请先在配置管理中设置 CPA base_url 与 api_key")
-			s.logImageRequest(imageRequestLogEntry{
-				StartedAt:      startedAt.Format(time.RFC3339Nano),
-				FinishedAt:     time.Now().Format(time.RFC3339Nano),
-				Endpoint:       r.URL.Path,
-				Operation:      operation,
-				ImageMode:      mode,
-				Direction:      "cpa",
-				Route:          "cpa",
-				AccountType:    account.Type,
-				AccountEmail:   account.Email,
-				AccountFile:    authFile.Name,
-				RequestedModel: requestedModel,
-				Preferred:      preferredAccount,
-				Success:        false,
-				Error:          err.Error(),
-			})
-			if mode == "mix" && !preferredAccount {
-				return nil, true, err
+			entry := imageRequestLogEntry{
+				StartedAt:            startedAt.Format(time.RFC3339Nano),
+				FinishedAt:           time.Now().Format(time.RFC3339Nano),
+				Endpoint:             r.URL.Path,
+				Operation:            operation,
+				ImageMode:            mode,
+				Direction:            "cpa",
+				Route:                "cpa",
+				CPASubroute:          s.cfg.CPAImageRouteStrategy(),
+				AccountType:          account.Type,
+				AccountEmail:         account.Email,
+				AccountFile:          authFile.Name,
+				RequestedModel:       requestedModel,
+				Preferred:            preferredAccount,
+				Success:              false,
+				Error:                err.Error(),
+				LeaseAcquired:        releaseLease != nil,
+				QueueWaitMS:          admissionInfo.QueueWaitMS,
+				InflightCountAtStart: admissionInfo.InflightCountAtStart,
 			}
+			if requestErr, ok := err.(*requestError); ok {
+				entry.ErrorCode = requestErr.code
+			}
+			applyImageRoutingLogFields(routingDecision, &entry)
+			metadata.applyTo(&entry)
+			s.logImageRequest(entry)
 			return nil, false, err
 		}
-		client = newCPAImageClient(
-			s.cfg.CPAImageBaseURL(),
-			s.cfg.CPAImageAPIKey(),
-			time.Duration(max(10, s.cfg.CPAImageRequestTimeout()))*time.Second,
-		)
+		client = s.newCPAWorkflowClient()
 		upstreamModel = cpaFixedImageModel
 		route = "cpa"
 		direction = "cpa"
@@ -726,43 +1369,75 @@ func (s *Server) runImageRequest(ctx context.Context, authFile *accounts.LocalAu
 		upstreamModel = s.resolveImageUpstreamModel(requestedModel, account.Type)
 		direction = "official"
 		if shouldUseOfficialResponses(preferredAccount, responsesEligible, route) {
-			client = handler.NewResponsesClientWithProxyAndConfig(
-				authFile.AccessToken,
-				s.cfg.ChatGPTProxyURL(),
-				authFile.Data,
-				s.imageRequestConfig(),
-			)
+			client = s.newResponsesWorkflowClient(authFile.AccessToken, authFile.Data)
 		} else {
-			client = handler.NewChatGPTClientWithProxyAndConfig(
-				authFile.AccessToken,
-				firstNonEmpty(stringValue(authFile.Data["cookies"]), stringValue(authFile.Data["cookie"])),
-				s.cfg.ChatGPTProxyURL(),
-				s.imageRequestConfig(),
-			)
+			client = s.newOfficialWorkflowClient(authFile.AccessToken, authFile.Data)
 		}
 	}
+	if setter, ok := client.(interface{ SetRequestedImageModel(string) }); ok {
+		setter.SetRequestedImageModel(requestedModel)
+	}
+	if toolModelProvider, ok := client.(interface{ ImageToolModel() string }); ok {
+		imageToolModel = strings.TrimSpace(toolModelProvider.ImageToolModel())
+	}
 	results, err := run(client, upstreamModel)
+	cpaSubroute := ""
+	if cpaClient, ok := client.(cpaRouteAwareImageWorkflowClient); ok {
+		cpaSubroute = cpaClient.LastRoute()
+		if label := strings.TrimSpace(cpaClient.LastModelLabel()); label != "" {
+			upstreamModel = label
+		}
+	}
+	if route == "legacy" {
+		if routeAwareClient, ok := client.(interface{ LastRoute() string }); ok {
+			if actualRoute := strings.TrimSpace(routeAwareClient.LastRoute()); actualRoute != "" {
+				route = actualRoute
+			}
+		}
+	}
+	if imageToolModel == "" {
+		imageToolModel = strings.TrimSpace(resolveLoggedImageToolModel(requestedModel))
+	}
+	admissionInfo = imageAdmissionFromContext(ctx)
 	if err != nil {
-		s.store.RecordImageResult(authFile.AccessToken, false)
-		s.logImageRequest(imageRequestLogEntry{
-			StartedAt:      startedAt.Format(time.RFC3339Nano),
-			FinishedAt:     time.Now().Format(time.RFC3339Nano),
-			Endpoint:       r.URL.Path,
-			Operation:      operation,
-			ImageMode:      mode,
-			Direction:      direction,
-			Route:          route,
-			AccountType:    account.Type,
-			AccountEmail:   account.Email,
-			AccountFile:    authFile.Name,
-			RequestedModel: requestedModel,
-			UpstreamModel:  upstreamModel,
-			Preferred:      preferredAccount,
-			Success:        false,
-			Error:          err.Error(),
-		})
+		store.RecordImageResult(authFile.AccessToken, false)
+		entry := imageRequestLogEntry{
+			StartedAt:            startedAt.Format(time.RFC3339Nano),
+			FinishedAt:           time.Now().Format(time.RFC3339Nano),
+			Endpoint:             r.URL.Path,
+			Operation:            operation,
+			ImageMode:            mode,
+			Direction:            direction,
+			Route:                route,
+			CPASubroute:          cpaSubroute,
+			AccountType:          account.Type,
+			AccountEmail:         account.Email,
+			AccountFile:          authFile.Name,
+			RequestedModel:       requestedModel,
+			UpstreamModel:        upstreamModel,
+			ImageToolModel:       imageToolModel,
+			Preferred:            preferredAccount,
+			Success:              false,
+			Error:                err.Error(),
+			LeaseAcquired:        releaseLease != nil,
+			QueueWaitMS:          admissionInfo.QueueWaitMS,
+			InflightCountAtStart: admissionInfo.InflightCountAtStart,
+		}
+		if requestErr, ok := err.(*requestError); ok {
+			entry.ErrorCode = requestErr.code
+		}
+		applyImageRoutingLogFields(routingDecision, &entry)
+		metadata.applyTo(&entry)
+		s.logImageRequest(entry)
+		if isImageRateLimitError(err) {
+			store.MarkImageAccountLimited(authFile.AccessToken)
+			if preferredAccount {
+				return nil, false, newRequestError("source_account_rate_limited", "原始图片所属账号当前已限流，请稍后重试或使用普通编辑")
+			}
+			return nil, true, err
+		}
 		if isInvalidImageTokenError(err) {
-			s.store.MarkImageTokenAbnormal(authFile.AccessToken)
+			store.MarkImageTokenAbnormal(authFile.AccessToken)
 			if preferredAccount {
 				return nil, false, newRequestError("source_account_unavailable", "原始图片所属账号当前不可用，请使用普通编辑重试")
 			}
@@ -774,24 +1449,32 @@ func (s *Server) runImageRequest(ctx context.Context, authFile *accounts.LocalAu
 		return nil, false, err
 	}
 
-	s.store.RecordImageResult(authFile.AccessToken, true)
-	s.logImageRequest(imageRequestLogEntry{
-		StartedAt:      startedAt.Format(time.RFC3339Nano),
-		FinishedAt:     time.Now().Format(time.RFC3339Nano),
-		Endpoint:       r.URL.Path,
-		Operation:      operation,
-		ImageMode:      mode,
-		Direction:      direction,
-		Route:          route,
-		AccountType:    account.Type,
-		AccountEmail:   account.Email,
-		AccountFile:    authFile.Name,
-		RequestedModel: requestedModel,
-		UpstreamModel:  upstreamModel,
-		Preferred:      preferredAccount,
-		Success:        true,
-	})
-	return buildImageResponse(r, client, results, responseFormat, account.ID), false, nil
+	store.RecordImageResult(authFile.AccessToken, true)
+	entry := imageRequestLogEntry{
+		StartedAt:            startedAt.Format(time.RFC3339Nano),
+		FinishedAt:           time.Now().Format(time.RFC3339Nano),
+		Endpoint:             r.URL.Path,
+		Operation:            operation,
+		ImageMode:            mode,
+		Direction:            direction,
+		Route:                route,
+		CPASubroute:          cpaSubroute,
+		AccountType:          account.Type,
+		AccountEmail:         account.Email,
+		AccountFile:          authFile.Name,
+		RequestedModel:       requestedModel,
+		UpstreamModel:        upstreamModel,
+		ImageToolModel:       imageToolModel,
+		Preferred:            preferredAccount,
+		Success:              true,
+		LeaseAcquired:        releaseLease != nil,
+		QueueWaitMS:          admissionInfo.QueueWaitMS,
+		InflightCountAtStart: admissionInfo.InflightCountAtStart,
+	}
+	applyImageRoutingLogFields(routingDecision, &entry)
+	metadata.applyTo(&entry)
+	s.logImageRequest(entry)
+	return buildImageResponse(r, client, results, responseFormat, account.ID, s.cfg.ResolvePath(s.cfg.Storage.ImageDir)), false, nil
 }
 
 func normalizeRequestedImageModel(requested, fallback string) string {
@@ -807,13 +1490,69 @@ func normalizeRequestedImageModel(requested, fallback string) string {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"object": "list",
-		"data": []map[string]any{
-			{"id": "gpt-image-1", "object": "model", "created": 1700000000, "owned_by": "openai"},
-			{"id": "gpt-image-2", "object": "model", "created": 1700000001, "owned_by": "openai"},
-		},
-	})
+	models := s.availableModels()
+	items := make([]map[string]any, 0, len(models))
+	for index, model := range models {
+		items = append(items, map[string]any{
+			"id":       model,
+			"object":   "model",
+			"created":  1700000000 + index,
+			"owned_by": "openai",
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": items})
+}
+
+func (s *Server) availableModels() []string {
+	seen := map[string]struct{}{}
+	items := make([]string, 0)
+	add := func(value string) {
+		model := strings.TrimSpace(value)
+		if model == "" {
+			return
+		}
+		if _, ok := seen[model]; ok {
+			return
+		}
+		seen[model] = struct{}{}
+		items = append(items, model)
+	}
+
+	add("gpt-image-2")
+	add(strings.TrimSpace(s.cfg.ChatGPT.Model))
+
+	accountsList, err := s.getStore().ListAccounts()
+	hasFree := err != nil
+	hasPaid := err != nil
+	if err == nil {
+		hasFree = false
+		hasPaid = false
+		for _, account := range accountsList {
+			switch account.Type {
+			case "Plus", "Pro", "Team":
+				hasPaid = true
+			case "Free":
+				hasFree = true
+			}
+		}
+	}
+
+	if hasFree {
+		add(s.cfg.ChatGPT.FreeImageModel)
+	}
+	if hasPaid {
+		add(s.cfg.ChatGPT.PaidImageModel)
+	}
+	if strings.EqualFold(strings.TrimSpace(s.cfg.ChatGPT.FreeImageModel), "auto") {
+		add("auto")
+	}
+	if s.cfg.ChatGPT.PaidImageRoute == "responses" || s.cfg.ChatGPT.FreeImageRoute == "responses" {
+		add("gpt-5.4-mini")
+		add("gpt-5.4")
+		add("gpt-5.5")
+		add("gpt-5-5-thinking")
+	}
+	return items
 }
 
 func (s *Server) handleWebApp(w http.ResponseWriter, r *http.Request) {
@@ -822,8 +1561,19 @@ func (s *Server) handleWebApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Path == "/portal" || r.URL.Path == "/portal/" || strings.HasPrefix(r.URL.Path, "/portal/") {
+		requestPath := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/portal"), "/")
+		asset := resolveStaticAsset(s.portalStaticDir, requestPath)
+		if asset == "" {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFile(w, r, asset)
+		return
+	}
+
 	requestPath := strings.TrimPrefix(r.URL.Path, "/")
-	asset := resolveStaticAsset(s.staticDir, requestPath)
+	asset := resolveStaticAsset(s.getStaticDir(), requestPath)
 	if asset == "" {
 		http.NotFound(w, r)
 		return
@@ -847,6 +1597,10 @@ func (s *Server) requireImageAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if _, ok := s.portalUserFromRequest(r); ok {
+			next.ServeHTTP(w, r)
+			return
+		}
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authorization is invalid"})
 	})
 }
@@ -866,6 +1620,22 @@ func (s *Server) hasAnyBearer(r *http.Request, keys ...string) bool {
 
 func (s *Server) hasExactBearer(r *http.Request, key string) bool {
 	return strings.TrimSpace(key) != "" && bearerFromRequest(r) == strings.TrimSpace(key)
+}
+
+func (s *Server) isThirdPartyImageAPIRequest(r *http.Request) bool {
+	token := bearerFromRequest(r)
+	if token == "" || s == nil || s.cfg == nil {
+		return false
+	}
+	if strings.TrimSpace(s.cfg.App.AuthKey) != "" && token == strings.TrimSpace(s.cfg.App.AuthKey) {
+		return false
+	}
+	for _, key := range parseKeys(s.cfg.App.APIKey) {
+		if token == key {
+			return true
+		}
+	}
+	return false
 }
 
 func bearerFromRequest(r *http.Request) string {
@@ -1028,7 +1798,7 @@ func decodeBase64Image(value string) ([]byte, error) {
 }
 
 func (s *Server) findAccountByID(accountID string) (accounts.PublicAccount, error) {
-	items, err := s.store.ListAccounts()
+	items, err := s.getStore().ListAccounts()
 	if err != nil {
 		return accounts.PublicAccount{}, err
 	}
@@ -1147,6 +1917,34 @@ func isInvalidImageTokenError(err error) bool {
 	return false
 }
 
+func isImageRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	for _, token := range []string{
+		"http 429",
+		" http 429",
+		"http 429:",
+		"http 429 ",
+		"status 429",
+		"too many requests",
+		"rate limit",
+		"rate_limit",
+		"quota exceeded",
+		"resource exhausted",
+		"temporarily unavailable",
+		"image generation limit",
+		"image generation quota",
+		"限流",
+	} {
+		if strings.Contains(message, token) {
+			return true
+		}
+	}
+	return false
+}
+
 func isConversationContextError(err error) bool {
 	if err == nil {
 		return false
@@ -1161,11 +1959,18 @@ func isInvalidRefreshError(message string) bool {
 		strings.Contains(strings.ToLower(strings.TrimSpace(message)), "http 401")
 }
 
-func isImageAccountUsable(account accounts.PublicAccount) bool {
-	return account.Status != "禁用" &&
+func isImageAccountUsable(account accounts.PublicAccount, allowDisabled bool) bool {
+	return (allowDisabled || account.Status != "禁用") &&
 		account.Status != "异常" &&
 		account.Status != "限流" &&
 		account.Quota > 0
+}
+
+func (s *Server) allowDisabledStudioImageAccounts() bool {
+	return s != nil &&
+		s.cfg != nil &&
+		s.configuredImageMode() == "studio" &&
+		s.cfg.ChatGPT.StudioAllowDisabledImageAccounts
 }
 
 func (s *Server) configuredImageMode() string {
@@ -1175,15 +1980,8 @@ func (s *Server) configuredImageMode() string {
 	return "studio"
 }
 
-func shouldUseCPAImageRoute(mode, accountType string) bool {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "cpa":
-		return true
-	case "mix":
-		return isPaidImageAccountType(accountType)
-	default:
-		return false
-	}
+func shouldUseCPAImageRoute(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), "cpa")
 }
 
 func isPaidImageAccountType(accountType string) bool {
@@ -1242,6 +2040,17 @@ func normalizeConfiguredImageRoute(value, fallback string) string {
 		return "responses"
 	default:
 		return strings.ToLower(strings.TrimSpace(fallback))
+	}
+}
+
+func resolveLoggedImageToolModel(requestedModel string) string {
+	switch strings.ToLower(strings.TrimSpace(requestedModel)) {
+	case "gpt-image-1":
+		return "gpt-image-1"
+	case "gpt-image-2":
+		return "gpt-image-2"
+	default:
+		return ""
 	}
 }
 

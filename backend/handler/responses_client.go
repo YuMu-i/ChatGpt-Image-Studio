@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"chatgpt2api/internal/imaging"
 	"github.com/google/uuid"
 )
 
@@ -23,13 +24,14 @@ const (
 	codexResponsesOriginator = "codex-tui"
 	maxResponsesInlineImages = 1
 	maxResponsesInlineBytes  = 768 << 10
+	maxResponsesSSELineBytes = 128 << 20
 )
 
 type ImageWorkflowClient interface {
 	DownloadBytes(url string) ([]byte, error)
 	DownloadAsBase64(ctx context.Context, url string) (string, error)
 	GenerateImage(ctx context.Context, prompt, model string, n int, size, quality, background string) ([]ImageResult, error)
-	EditImageByUpload(ctx context.Context, prompt, model string, images [][]byte, mask []byte) ([]ImageResult, error)
+	EditImageByUpload(ctx context.Context, prompt, model string, images [][]byte, mask []byte, size, quality string) ([]ImageResult, error)
 	InpaintImageByMask(
 		ctx context.Context,
 		prompt string,
@@ -43,9 +45,10 @@ type ImageWorkflowClient interface {
 }
 
 type ResponsesClient struct {
-	backend    *ChatGPTClient
-	accountID  string
-	httpClient *http.Client
+	backend             *ChatGPTClient
+	accountID           string
+	httpClient          *http.Client
+	requestedImageModel string
 }
 
 func NewResponsesClientWithProxy(accessToken, proxyURL string, authData map[string]any) *ResponsesClient {
@@ -85,17 +88,17 @@ func (c *ResponsesClient) DownloadAsBase64(ctx context.Context, url string) (str
 }
 
 func (c *ResponsesClient) GenerateImage(ctx context.Context, prompt, model string, n int, size, quality, background string) ([]ImageResult, error) {
-	return c.generateViaResponses(ctx, buildResponsesPrompt(prompt, size, quality, background), model, nil, nil)
+	return c.generateViaResponses(ctx, buildResponsesPrompt(prompt), model, size, quality, background, nil, nil)
 }
 
-func (c *ResponsesClient) EditImageByUpload(ctx context.Context, prompt, model string, images [][]byte, mask []byte) ([]ImageResult, error) {
+func (c *ResponsesClient) EditImageByUpload(ctx context.Context, prompt, model string, images [][]byte, mask []byte, size, quality string) ([]ImageResult, error) {
 	if len(images) == 0 {
 		return nil, fmt.Errorf("at least one image is required")
 	}
 	if !SupportsResponsesInlineEdit(images, mask) {
 		return nil, fmt.Errorf("responses inline edit payload is too large")
 	}
-	return c.generateViaResponses(ctx, buildResponsesEditPrompt(prompt, len(images), len(mask) > 0), model, images, mask)
+	return c.generateViaResponses(ctx, buildResponsesEditPrompt(prompt, len(images), len(mask) > 0), model, size, quality, "", images, mask)
 }
 
 func (c *ResponsesClient) InpaintImageByMask(
@@ -111,7 +114,7 @@ func (c *ResponsesClient) InpaintImageByMask(
 	return nil, fmt.Errorf("selection edit requires conversation context")
 }
 
-func (c *ResponsesClient) generateViaResponses(ctx context.Context, prompt, model string, images [][]byte, mask []byte) ([]ImageResult, error) {
+func (c *ResponsesClient) generateViaResponses(ctx context.Context, prompt, model string, size, quality, background string, images [][]byte, mask []byte) ([]ImageResult, error) {
 	if c == nil || c.backend == nil {
 		return nil, fmt.Errorf("responses client is not initialized")
 	}
@@ -124,6 +127,21 @@ func (c *ResponsesClient) generateViaResponses(ctx context.Context, prompt, mode
 	model = strings.TrimSpace(model)
 	if model == "" {
 		model = defaultUpstreamModel
+	}
+	toolAction := "generate"
+	if len(images) > 0 {
+		toolAction = "edit"
+	}
+	tool, err := buildResponsesImageGenerationToolWithOptions(responsesImageToolOptions{
+		RequestedModel: c.resolveRequestedImageToolModel(),
+		Action:         toolAction,
+		Size:           size,
+		Quality:        quality,
+		Background:     background,
+		Mask:           mask,
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	content := make([]map[string]any, 0, 1+len(images))
@@ -140,17 +158,10 @@ func (c *ResponsesClient) generateViaResponses(ctx context.Context, prompt, mode
 			"image_url": encodeImageDataURL(image, detectMIME(image)),
 		})
 	}
-	if len(mask) > 0 {
-		content = append(content, map[string]any{
-			"type":      "input_image",
-			"image_url": encodeImageDataURL(mask, detectMIME(mask)),
-		})
-	}
-
 	payload := map[string]any{
 		"model":               model,
 		"input":               []any{map[string]any{"role": "user", "content": content}},
-		"tools":               []any{map[string]any{"type": "image_generation", "output_format": "png"}},
+		"tools":               []any{tool},
 		"tool_choice":         map[string]any{"type": "image_generation"},
 		"instructions":        "You generate and edit images for the user.",
 		"stream":              true,
@@ -184,9 +195,58 @@ func (c *ResponsesClient) generateViaResponses(ctx context.Context, prompt, mode
 	return c.parseResponsesSSE(resp.Body, prompt)
 }
 
+func buildResponsesImageGenerationTool(size, quality, background string) (map[string]any, error) {
+	return buildResponsesImageGenerationToolWithOptions(responsesImageToolOptions{
+		Action:     "generate",
+		Size:       size,
+		Quality:    quality,
+		Background: background,
+	})
+}
+
+type responsesImageToolOptions struct {
+	RequestedModel string
+	Action         string
+	Size           string
+	Quality        string
+	Background     string
+	Mask           []byte
+}
+
+func buildResponsesImageGenerationToolWithOptions(options responsesImageToolOptions) (map[string]any, error) {
+	tool := map[string]any{
+		"type":          "image_generation",
+		"output_format": "png",
+	}
+	if model := normalizeResponsesImageToolModel(options.RequestedModel); model != "" {
+		tool["model"] = model
+	}
+	if action := strings.ToLower(strings.TrimSpace(options.Action)); action != "" {
+		tool["action"] = action
+	}
+	if normalized := imaging.NormalizeGenerateSize(options.Size); normalized != "" {
+		if err := imaging.ValidateGenerateSize(normalized); err != nil {
+			return nil, err
+		}
+		tool["size"] = normalized
+	}
+	if normalizedQuality := normalizeResponsesImageQuality(options.Quality); normalizedQuality != "" {
+		tool["quality"] = normalizedQuality
+	}
+	if normalizedBackground := normalizeResponsesImageBackground(options.Background); normalizedBackground != "" {
+		tool["background"] = normalizedBackground
+	}
+	if len(options.Mask) > 0 {
+		tool["input_image_mask"] = map[string]any{
+			"image_url": encodeImageDataURL(options.Mask, detectMIME(options.Mask)),
+		}
+	}
+	return tool, nil
+}
+
 func (c *ResponsesClient) parseResponsesSSE(reader io.Reader, prompt string) ([]ImageResult, error) {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
+	scanner.Buffer(make([]byte, 0, 1024*1024), maxResponsesSSELineBytes)
 
 	var dataLines []string
 	finalImages := make([]ImageResult, 0)
@@ -309,18 +369,8 @@ func (c *ResponsesClient) setResponsesHeaders(req *http.Request) {
 	req.Header.Set("Connection", "Keep-Alive")
 }
 
-func buildResponsesPrompt(prompt, size, quality, background string) string {
-	fullPrompt := strings.TrimSpace(prompt)
-	if size != "" && size != "auto" && size != "1024x1024" {
-		fullPrompt = fmt.Sprintf("Generate an image with size %s. %s", size, fullPrompt)
-	}
-	if quality == "hd" || quality == "high" {
-		fullPrompt = fmt.Sprintf("Generate a high-quality, detailed image: %s", fullPrompt)
-	}
-	if background == "transparent" {
-		fullPrompt += " The image must have a transparent background (PNG with alpha channel)."
-	}
-	return fullPrompt
+func buildResponsesPrompt(prompt string) string {
+	return strings.TrimSpace(prompt)
 }
 
 func buildResponsesEditPrompt(prompt string, imageCount int, hasMask bool) string {
@@ -430,4 +480,49 @@ func SupportsResponsesInlineEdit(images [][]byte, mask []byte) bool {
 	}
 	totalBytes += len(mask)
 	return totalBytes > 0 && totalBytes <= maxResponsesInlineBytes
+}
+
+func (c *ResponsesClient) SetRequestedImageModel(model string) {
+	if c == nil {
+		return
+	}
+	c.requestedImageModel = strings.TrimSpace(model)
+}
+
+func (c *ResponsesClient) resolveRequestedImageToolModel() string {
+	if c == nil {
+		return normalizeResponsesImageToolModel("")
+	}
+	return normalizeResponsesImageToolModel(c.requestedImageModel)
+}
+
+func (c *ResponsesClient) ImageToolModel() string {
+	return c.resolveRequestedImageToolModel()
+}
+
+func normalizeResponsesImageQuality(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
+	case "":
+		return ""
+	case "hd":
+		return "high"
+	default:
+		return normalized
+	}
+}
+
+func normalizeResponsesImageBackground(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeResponsesImageToolModel(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "gpt-image-1":
+		return "gpt-image-1"
+	case "gpt-image-2":
+		return "gpt-image-2"
+	default:
+		return "gpt-image-2"
+	}
 }

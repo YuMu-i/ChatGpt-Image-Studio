@@ -25,9 +25,9 @@ const (
 
 const (
 	defaultRequestTimeout = 30 * time.Second
-	defaultSSETimeout     = 5 * time.Minute
+	defaultSSETimeout     = 10 * time.Minute
 	defaultPollInterval   = 3 * time.Second
-	defaultPollMaxWait    = 3 * time.Minute
+	defaultPollMaxWait    = 10 * time.Minute
 )
 
 type ImageRequestConfig struct {
@@ -50,6 +50,9 @@ func normalizeImageRequestConfig(cfg ImageRequestConfig) ImageRequestConfig {
 	if cfg.PollMaxWait <= 0 {
 		cfg.PollMaxWait = defaultPollMaxWait
 	}
+	if cfg.PollMaxWait < cfg.SSETimeout {
+		cfg.PollMaxWait = cfg.SSETimeout
+	}
 	return cfg
 }
 
@@ -64,14 +67,15 @@ type ImageResult struct {
 }
 
 type ChatGPTClient struct {
-	accessToken  string
-	cookies      string
-	oaiDeviceID  string
-	httpClient   *http.Client
-	streamClient *http.Client
-	proxyURL     string
-	pollInterval time.Duration
-	pollMaxWait  time.Duration
+	accessToken    string
+	cookies        string
+	oaiDeviceID    string
+	httpClient     *http.Client
+	streamClient   *http.Client
+	proxyURL       string
+	pollInterval   time.Duration
+	pollMaxWait    time.Duration
+	lastImageRoute string
 }
 
 func NewChatGPTClient(accessToken, cookies string) *ChatGPTClient {
@@ -153,7 +157,24 @@ func (c *ChatGPTClient) GenerateImage(ctx context.Context, prompt, model string,
 	}
 
 	body := c.buildConversationBody(fullPrompt, model, "", "", nil)
-	return c.doConversation(ctx, body)
+	fBody := cloneConversationBody(body)
+	fBody["client_prepare_state"] = "none"
+	fBody["supported_encodings"] = []string{"v1"}
+
+	images, err := c.doFConversation(ctx, fBody)
+	if err == nil {
+		c.setLastImageRoute("f-conversation")
+		return images, nil
+	}
+	if !shouldFallbackFromFConversation(err) {
+		return nil, err
+	}
+
+	images, err = c.doConversation(ctx, body)
+	if err == nil {
+		c.setLastImageRoute("conversation")
+	}
+	return images, err
 }
 
 // DownloadBytes fetches a URL using authenticated headers and returns its raw bytes.
@@ -410,7 +431,7 @@ func detectImageSize(data []byte) (int, int) {
 
 // EditImageByUpload uploads images to ChatGPT, then sends an edit conversation.
 // images is a list of image byte slices. mask is optional (nil = no mask).
-func (c *ChatGPTClient) EditImageByUpload(ctx context.Context, prompt, model string, images [][]byte, mask []byte) ([]ImageResult, error) {
+func (c *ChatGPTClient) EditImageByUpload(ctx context.Context, prompt, model string, images [][]byte, mask []byte, size, quality string) ([]ImageResult, error) {
 	if len(images) == 0 {
 		return nil, fmt.Errorf("at least one image is required")
 	}
@@ -436,7 +457,15 @@ func (c *ChatGPTClient) EditImageByUpload(ctx context.Context, prompt, model str
 		}
 	}
 
-	body := c.buildMultimodalBody(prompt, model, uploads, maskUpload)
+	fullPrompt := prompt
+	if strings.TrimSpace(size) != "" && size != "auto" && size != "1024x1024" {
+		fullPrompt = fmt.Sprintf("Edit and output the image with size %s. %s", size, prompt)
+	}
+	if quality == "hd" || quality == "high" {
+		fullPrompt = fmt.Sprintf("Generate a high-quality, detailed edited image: %s", fullPrompt)
+	}
+
+	body := c.buildMultimodalBody(fullPrompt, model, uploads, maskUpload)
 	return c.doConversation(ctx, body)
 }
 
@@ -671,6 +700,14 @@ func (c *ChatGPTClient) buildConversationBody(prompt, model, conversationID, par
 }
 
 func (c *ChatGPTClient) doConversation(ctx context.Context, body map[string]any) ([]ImageResult, error) {
+	return c.doConversationRequest(ctx, body, "/conversation", "conversation")
+}
+
+func (c *ChatGPTClient) doFConversation(ctx context.Context, body map[string]any) ([]ImageResult, error) {
+	return c.doConversationRequest(ctx, body, "/f/conversation", "f conversation")
+}
+
+func (c *ChatGPTClient) doConversationRequest(ctx context.Context, body map[string]any, path, routeLabel string) ([]ImageResult, error) {
 	requestContext := extractConversationRequestContext(body)
 
 	// Step 1: Get sentinel chat-requirements token + PoW challenge
@@ -684,8 +721,7 @@ func (c *ChatGPTClient) doConversation(ctx context.Context, body map[string]any)
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
 
-	// Step 2: Use /backend-api/conversation (NOT /f/conversation) — works with PoW only
-	req, _ := http.NewRequestWithContext(ctx, "POST", baseURL+"/conversation", bytes.NewReader(jsonBody))
+	req, _ := http.NewRequestWithContext(ctx, "POST", baseURL+path, bytes.NewReader(jsonBody))
 	c.setHeaders(req)
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("openai-sentinel-chat-requirements-token", chatToken)
@@ -695,13 +731,13 @@ func (c *ChatGPTClient) doConversation(ctx context.Context, body map[string]any)
 
 	resp, err := c.streamClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("conversation request: %w", err)
+		return nil, fmt.Errorf("%s request: %w", routeLabel, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return nil, fmt.Errorf("conversation returned %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("%s returned %d: %s", routeLabel, resp.StatusCode, string(respBody))
 	}
 
 	return c.parseSSE(ctx, resp.Body, requestContext)
@@ -1049,6 +1085,47 @@ func (c *ChatGPTClient) setHeaders(req *http.Request) {
 	if c.cookies != "" {
 		req.Header.Set("Cookie", c.cookies)
 	}
+}
+
+func (c *ChatGPTClient) LastRoute() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.lastImageRoute)
+}
+
+func (c *ChatGPTClient) setLastImageRoute(route string) {
+	if c == nil {
+		return
+	}
+	c.lastImageRoute = strings.TrimSpace(route)
+}
+
+func cloneConversationBody(body map[string]any) map[string]any {
+	if len(body) == 0 {
+		return map[string]any{}
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return map[string]any{}
+	}
+	cloned := map[string]any{}
+	if err := json.Unmarshal(raw, &cloned); err != nil {
+		return map[string]any{}
+	}
+	return cloned
+}
+
+func shouldFallbackFromFConversation(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if message == "" {
+		return false
+	}
+	return strings.Contains(message, "f conversation request:") ||
+		strings.Contains(message, "f conversation returned 5")
 }
 
 func extractFileID(pointer string) string {

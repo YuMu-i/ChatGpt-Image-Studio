@@ -1,11 +1,16 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"chatgpt2api/internal/accounts"
 	"chatgpt2api/internal/config"
 )
 
@@ -121,6 +126,140 @@ func TestHandleImageResponsesReturns400ForInvalidImageInput(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "invalid_image_input") {
 		t.Fatalf("body = %s, want invalid_image_input code", rec.Body.String())
 	}
+}
+
+func TestNormalizeThirdPartyImageResponseFormatForThirdPartyKey(t *testing.T) {
+	server := &Server{
+		cfg: &config.Config{
+			App: config.AppConfig{
+				APIKey:  "third-party-key",
+				AuthKey: "ui-key",
+			},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	req.Header.Set("Authorization", "Bearer third-party-key")
+	if got := server.normalizeThirdPartyImageResponseFormat(req, ""); got != "b64_json" {
+		t.Fatalf("normalizeThirdPartyImageResponseFormat(empty) = %q, want %q", got, "b64_json")
+	}
+	if got := server.normalizeThirdPartyImageResponseFormat(req, "url"); got != "b64_json" {
+		t.Fatalf("normalizeThirdPartyImageResponseFormat(url) = %q, want %q", got, "b64_json")
+	}
+	if got := server.normalizeThirdPartyImageResponseFormat(req, "b64_json"); got != "b64_json" {
+		t.Fatalf("normalizeThirdPartyImageResponseFormat(b64_json) = %q, want %q", got, "b64_json")
+	}
+
+	uiReq := httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	uiReq.Header.Set("Authorization", "Bearer ui-key")
+	if got := server.normalizeThirdPartyImageResponseFormat(uiReq, ""); got != "" {
+		t.Fatalf("normalizeThirdPartyImageResponseFormat(ui empty) = %q, want empty string", got)
+	}
+	if got := server.normalizeThirdPartyImageResponseFormat(uiReq, "url"); got != "url" {
+		t.Fatalf("normalizeThirdPartyImageResponseFormat(ui url) = %q, want %q", got, "url")
+	}
+}
+
+func TestImageGenerationPreservesPaidResolutionErrorCode(t *testing.T) {
+	server := newCompatFreeOnlyStudioServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{
+		"prompt":"test prompt",
+		"size":"3840x2160",
+		"quality":"high",
+		"response_format":"b64_json"
+	}`))
+	req.Header.Set("Authorization", "Bearer "+server.cfg.App.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadGateway, rec.Body.String())
+	}
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if payload.Error.Code != "paid_resolution_requires_paid_account" {
+		t.Fatalf("error code = %q, want %q", payload.Error.Code, "paid_resolution_requires_paid_account")
+	}
+}
+
+func newCompatFreeOnlyStudioServer(t *testing.T) *Server {
+	t.Helper()
+
+	rootDir := t.TempDir()
+	cfg := config.New(rootDir)
+	if err := cfg.Load(); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cfg.App.APIKey = "test-image-key"
+	cfg.App.AuthKey = "test-ui-key"
+	cfg.App.ImageFormat = "b64_json"
+	cfg.ChatGPT.Model = "gpt-image-2"
+	cfg.ChatGPT.ImageMode = "studio"
+	cfg.ChatGPT.FreeImageRoute = "responses"
+	cfg.ChatGPT.FreeImageModel = "auto"
+	cfg.ChatGPT.PaidImageRoute = "responses"
+	cfg.ChatGPT.PaidImageModel = "gpt-5.4-mini"
+
+	authDir := cfg.ResolvePath(cfg.Storage.AuthDir)
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("create auth dir: %v", err)
+	}
+	statePath := cfg.ResolvePath(cfg.Storage.StateFile)
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatalf("create state dir: %v", err)
+	}
+
+	if err := writeCompatTestJSON(filepath.Join(authDir, "free.json"), map[string]any{
+		"type":         "codex",
+		"access_token": "token-free",
+		"email":        "free@example.com",
+		"priority":     0,
+	}); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	if err := writeCompatTestJSON(statePath, map[string]any{
+		"accounts": map[string]any{
+			"free.json": map[string]any{
+				"type":        "Free",
+				"status":      "正常",
+				"quota":       5,
+				"quota_known": true,
+				"priority":    0,
+				"limits_progress": []map[string]any{
+					{
+						"feature_name": "image_gen",
+						"remaining":    5,
+						"reset_after":  time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+					},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("write state file: %v", err)
+	}
+
+	store, err := accounts.NewStore(cfg)
+	if err != nil {
+		t.Fatalf("new account store: %v", err)
+	}
+	return NewServer(cfg, store, nil, nil)
+}
+
+func writeCompatTestJSON(path string, payload any) error {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o644)
 }
 
 func TestBuildCompatResponsesResponse(t *testing.T) {
