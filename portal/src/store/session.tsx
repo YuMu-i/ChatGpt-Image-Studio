@@ -51,7 +51,7 @@ export function PortalSessionProvider({ children }: { children: React.ReactNode 
       setQuota(null);
       setInitialized(true);
       if (typeof window !== "undefined") {
-        window.location.href = "/portal/login";
+        window.location.href = "/login";
       }
     }
   };

@@ -37,7 +37,7 @@ request.interceptors.response.use(
     const shouldRedirect =
       (error.config as RequestConfig | undefined)?.redirectOnUnauthorized !== false;
     if (status === 401 && shouldRedirect && typeof window !== "undefined") {
-      window.location.href = "/portal/login";
+      window.location.href = "/login";
     }
 
     const payload = error.response?.data;
