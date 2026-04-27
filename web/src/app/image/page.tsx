@@ -1540,7 +1540,7 @@ export default function ImagePage() {
         "order-1 flex flex-col overflow-visible lg:order-none lg:min-h-0 lg:overflow-hidden",
         isStandaloneWorkspace
           ? "rounded-none border-0 bg-transparent shadow-none"
-          : "rounded-[30px] border border-stone-200 bg-white shadow-[0_14px_40px_rgba(15,23,42,0.05)]",
+          : "rounded-[30px] border border-stone-200 bg-white shadow-[0_14px_40px_rgba(15,23,42,0.05)] transition-colors duration-200 dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel)] dark:shadow-[0_20px_60px_-36px_rgba(0,0,0,0.78)]",
       )}
     >
       <WorkspaceHeader
@@ -1560,7 +1560,7 @@ export default function ImagePage() {
       <div
         className={cn(
           "relative min-h-[240px] lg:min-h-0 lg:flex-1",
-          isStandaloneWorkspace ? "bg-transparent" : "bg-[#fcfcfb]",
+          isStandaloneWorkspace ? "bg-transparent" : "bg-[#fcfcfb] dark:bg-[var(--studio-panel-soft)]",
         )}
       >
         <div
@@ -1602,7 +1602,7 @@ export default function ImagePage() {
             type="button"
             onClick={() => scrollToBottom("smooth")}
             className={cn(
-              "absolute right-4 z-10 inline-flex size-11 items-center justify-center rounded-full border border-stone-200 bg-white/95 text-stone-700 shadow-lg shadow-stone-300/30 backdrop-blur transition hover:bg-white hover:text-stone-950 sm:right-5 lg:bottom-5",
+              "absolute right-4 z-10 inline-flex size-11 items-center justify-center rounded-full border border-stone-200 bg-white/95 text-stone-700 shadow-lg shadow-stone-300/30 backdrop-blur transition hover:bg-white hover:text-stone-950 dark:border-[var(--studio-border)] dark:bg-[color:var(--studio-panel-soft)] dark:text-[var(--studio-text)] dark:shadow-black/40 dark:hover:bg-[var(--studio-panel-muted)] dark:hover:text-[var(--studio-text-strong)] sm:right-5 lg:bottom-5",
               isMobileComposerCollapsed
                 ? "bottom-[72px] sm:bottom-[80px]"
                 : "bottom-[228px] sm:bottom-[244px]",

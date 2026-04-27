@@ -467,8 +467,8 @@ export default function SettingsPage() {
   return (
     <section className="h-full overflow-y-auto">
       <div className="mx-auto flex max-w-[1440px] flex-col gap-4 px-1 py-1 sm:gap-6">
-        <div className="sticky top-0 z-30 -mx-1 bg-gradient-to-b from-white/95 via-white/90 to-transparent px-1 pb-3 pt-1 backdrop-blur-sm">
-          <div className="rounded-[30px] border border-stone-200 bg-white px-4 py-4 shadow-[0_14px_40px_rgba(15,23,42,0.05)] sm:px-6 sm:py-5">
+        <div className="sticky top-0 z-30 -mx-1 bg-[#fcfcfb]/96 px-1 pb-3 pt-1 backdrop-blur-sm transition-colors duration-200 dark:bg-[var(--studio-bg)]">
+          <div className="rounded-[30px] border border-stone-200 bg-white/92 px-4 py-4 shadow-[0_14px_40px_rgba(15,23,42,0.05)] transition-colors duration-200 dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel)] sm:px-6 sm:py-5">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between lg:gap-4">
               <div className="min-w-0">
                 <div className="flex items-start gap-3 sm:gap-4">
