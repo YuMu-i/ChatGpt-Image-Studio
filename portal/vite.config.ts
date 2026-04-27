@@ -30,7 +30,7 @@ function syncBackendStaticPlugin(): PluginOption {
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), syncBackendStaticPlugin()],
-  base: "/portal/",
+  base: "/",
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

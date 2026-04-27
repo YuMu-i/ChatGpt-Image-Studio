@@ -30,6 +30,7 @@ function syncBackendStaticPlugin(): PluginOption {
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), syncBackendStaticPlugin()],
+  base: "/admin/",
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

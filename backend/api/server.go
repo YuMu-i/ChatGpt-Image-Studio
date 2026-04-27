@@ -1578,9 +1578,14 @@ func (s *Server) handleWebApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.URL.Path == "/portal" || r.URL.Path == "/portal/" || strings.HasPrefix(r.URL.Path, "/portal/") {
-		requestPath := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/portal"), "/")
-		asset := resolveStaticAsset(s.portalStaticDir, requestPath)
+	if target, ok := legacyPortalRedirectTarget(r.URL.Path); ok {
+		http.Redirect(w, r, appendQuery(target, r.URL.RawQuery), http.StatusPermanentRedirect)
+		return
+	}
+
+	if isAdminWebPath(r.URL.Path) {
+		requestPath := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/admin"), "/")
+		asset := resolveStaticAsset(s.getStaticDir(), requestPath)
 		if asset == "" {
 			http.NotFound(w, r)
 			return
@@ -1589,13 +1594,64 @@ func (s *Server) handleWebApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if target, ok := legacyAdminRedirectTarget(r.URL.Path); ok {
+		http.Redirect(w, r, appendQuery(target, r.URL.RawQuery), http.StatusPermanentRedirect)
+		return
+	}
+
 	requestPath := strings.TrimPrefix(r.URL.Path, "/")
-	asset := resolveStaticAsset(s.getStaticDir(), requestPath)
+	asset := resolveStaticAsset(s.portalStaticDir, requestPath)
 	if asset == "" {
 		http.NotFound(w, r)
 		return
 	}
 	http.ServeFile(w, r, asset)
+}
+
+func isAdminWebPath(path string) bool {
+	return path == "/admin" || path == "/admin/" || strings.HasPrefix(path, "/admin/")
+}
+
+func legacyPortalRedirectTarget(path string) (string, bool) {
+	if !(path == "/portal" || path == "/portal/" || strings.HasPrefix(path, "/portal/")) {
+		return "", false
+	}
+
+	requestPath := strings.TrimPrefix(strings.TrimPrefix(path, "/portal"), "/")
+	switch {
+	case requestPath == "":
+		return "/", true
+	case requestPath == "admin/users" || strings.HasPrefix(requestPath, "admin/users/"):
+		return "/users", true
+	default:
+		return "/" + requestPath, true
+	}
+}
+
+func legacyAdminRedirectTarget(path string) (string, bool) {
+	switch {
+	case path == "/accounts" || strings.HasPrefix(path, "/accounts/"):
+		return "/admin" + path, true
+	case path == "/settings" || strings.HasPrefix(path, "/settings/"):
+		return "/admin" + path, true
+	case path == "/requests" || strings.HasPrefix(path, "/requests/"):
+		return "/admin" + path, true
+	case path == "/startup-check" || strings.HasPrefix(path, "/startup-check/"):
+		return "/admin" + path, true
+	case path == "/image" || strings.HasPrefix(path, "/image/"):
+		return "/admin" + path, true
+	case path == "/login.html" || strings.HasPrefix(path, "/login.html/"):
+		return "/admin/login", true
+	default:
+		return "", false
+	}
+}
+
+func appendQuery(path, rawQuery string) string {
+	if strings.TrimSpace(rawQuery) == "" {
+		return path
+	}
+	return path + "?" + rawQuery
 }
 
 func (s *Server) requireUIAuth(next http.Handler) http.Handler {

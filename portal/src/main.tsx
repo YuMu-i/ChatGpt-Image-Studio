@@ -7,7 +7,7 @@ import { PortalSessionProvider } from "@/store/session";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BrowserRouter basename="/portal">
+    <BrowserRouter>
       <PortalSessionProvider>
         <App />
       </PortalSessionProvider>
