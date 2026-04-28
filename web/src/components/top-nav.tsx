@@ -12,10 +12,17 @@ import { ThemeToggleButton } from "@/components/theme-toggle-button";
 const repositoryUrl = "https://github.com/peiyizhi0724/ChatGpt-Image-Studio";
 
 function formatVersionLabel(value: string) {
-  const normalized = String(value || "")
-    .trim()
-    .replace(/^v+/i, "");
-  return normalized ? `v${normalized}` : "读取中";
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return "读取中";
+  }
+
+  const semanticMatch = normalized.match(/v?(\d+\.\d+\.\d+)/i);
+  if (semanticMatch?.[1]) {
+    return `v${semanticMatch[1]}`;
+  }
+
+  return normalized;
 }
 
 const navItems = [
