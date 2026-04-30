@@ -1016,6 +1016,7 @@ export default function ImagePage() {
 
   useEffect(() => {
     let disposed = false;
+    let fallbackTimer: number | null = null;
     let reconnectTimer: number | null = null;
     let pollingTimer: number | null = null;
     let streamAbort: AbortController | null = null;
@@ -1047,7 +1048,7 @@ export default function ImagePage() {
       void loadTasks();
       pollingTimer = window.setInterval(() => {
         void loadTasks();
-      }, 2000);
+      }, 10000);
     };
 
     const stopPolling = () => {
@@ -1057,11 +1058,20 @@ export default function ImagePage() {
       }
     };
 
+    const stopFallbackTimer = () => {
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+    };
+
     const startStream = () => {
+      streamAbort?.abort();
       streamAbort = new AbortController();
       void consumeImageTaskStream(
         {
           onInit: ({ items, snapshot }) => {
+            stopFallbackTimer();
             stopPolling();
             applyTaskPayload(items, snapshot);
           },
@@ -1077,20 +1087,27 @@ export default function ImagePage() {
         if (disposed) {
           return;
         }
+        stopFallbackTimer();
         startPolling();
         reconnectTimer = window.setTimeout(() => {
           if (!disposed) {
             startStream();
           }
-        }, 3000);
+        }, 10000);
       });
     };
 
-    startPolling();
+    void loadTasks();
+    fallbackTimer = window.setTimeout(() => {
+      if (!disposed) {
+        startPolling();
+      }
+    }, 5000);
     startStream();
 
     return () => {
       disposed = true;
+      stopFallbackTimer();
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
       }
