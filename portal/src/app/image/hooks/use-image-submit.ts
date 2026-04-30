@@ -1,24 +1,18 @@
 "use client";
 
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import { toast } from "sonner";
 
 import {
-  editImage,
-  generateImageWithOptions,
-  upscaleImage,
+  createImageTask,
   type ImageModel,
   type ImageQuality,
+  type ImageResolutionAccess,
 } from "@/lib/api";
-import {
-  finishImageTask,
-  startImageTask,
-} from "@/store/image-active-tasks";
 import type {
   ImageConversation,
   ImageConversationTurn,
   ImageMode,
-  StoredImage,
   StoredSourceImage,
 } from "@/store/image-conversations";
 
@@ -26,22 +20,10 @@ import type { EditorTarget } from "./use-image-source-inputs";
 import {
   buildConversationTitle,
   buildInpaintSourceReference,
-  countFailures,
   createConversationTurn,
   createLoadingImages,
-  dataUrlToFile,
-  formatImageError,
-  mergeResultImages,
-  shouldFallbackSelectionEdit,
 } from "../submit-utils";
-
-type ActiveRequestState = {
-  conversationId: string;
-  turnId: string;
-  mode: ImageMode;
-  count: number;
-  variant: "standard" | "selection-edit";
-};
+import { buildSourceImageUrl } from "../view-utils";
 
 type UseImageSubmitOptions = {
   mode: ImageMode;
@@ -52,22 +34,17 @@ type UseImageSubmitOptions = {
   sourceImages: StoredSourceImage[];
   parsedCount: number;
   imageSize: string;
+  imageResolutionAccess: ImageResolutionAccess;
   imageQuality: ImageQuality;
-  upscaleScale: string;
   selectedConversationId: string | null;
   editorTarget: EditorTarget | null;
-  isSubmitting: boolean;
   makeId: () => string;
   focusConversation: (conversationId: string) => void;
   closeSelectionEditor: () => void;
   setImagePrompt: (value: string) => void;
   setSourceImages: (value: StoredSourceImage[]) => void;
-  setIsSubmitting: (value: boolean) => void;
-  setActiveRequest: (value: ActiveRequestState | null) => void;
   setSubmitElapsedSeconds: (value: number) => void;
-  setSubmitStartedAt: (value: number | null) => void;
   persistConversation: (conversation: ImageConversation) => Promise<void>;
-  syncQuotaAfterResult: (images: StoredImage[]) => void;
   updateConversation: (
     conversationId: string,
     updater: (current: ImageConversation | null) => ImageConversation,
@@ -75,7 +52,10 @@ type UseImageSubmitOptions = {
   resetComposer: (nextMode?: ImageMode) => void;
 };
 
-function buildConversationBase(conversationId: string, draftTurn: ImageConversationTurn): ImageConversation {
+function buildConversationBase(
+  conversationId: string,
+  draftTurn: ImageConversationTurn,
+): ImageConversation {
   return {
     id: conversationId,
     title: draftTurn.title,
@@ -84,6 +64,7 @@ function buildConversationBase(conversationId: string, draftTurn: ImageConversat
     model: draftTurn.model,
     count: draftTurn.count,
     size: draftTurn.size,
+    resolutionAccess: draftTurn.resolutionAccess,
     quality: draftTurn.quality,
     scale: draftTurn.scale,
     sourceImages: draftTurn.sourceImages,
@@ -95,6 +76,36 @@ function buildConversationBase(conversationId: string, draftTurn: ImageConversat
   };
 }
 
+function buildSourceReference(payload: {
+  id: string;
+  role: "image" | "mask";
+  name: string;
+  url: string;
+}): StoredSourceImage {
+  if (payload.url.startsWith("data:")) {
+    return {
+      id: payload.id,
+      role: payload.role,
+      name: payload.name,
+      dataUrl: payload.url,
+    };
+  }
+  return {
+    id: payload.id,
+    role: payload.role,
+    name: payload.name,
+    url: payload.url,
+  };
+}
+
+function normalizeImageQuality(value: string | undefined, fallback: ImageQuality) {
+  const trimmed = String(value || "").trim();
+  if (trimmed === "low" || trimmed === "medium" || trimmed === "high") {
+    return trimmed;
+  }
+  return fallback;
+}
+
 export function useImageSubmit({
   mode,
   imagePrompt,
@@ -104,359 +115,349 @@ export function useImageSubmit({
   sourceImages,
   parsedCount,
   imageSize,
+  imageResolutionAccess,
   imageQuality,
-  upscaleScale,
   selectedConversationId,
   editorTarget,
-  isSubmitting,
   makeId,
   focusConversation,
   closeSelectionEditor,
   setImagePrompt,
   setSourceImages,
-  setIsSubmitting,
-  setActiveRequest,
   setSubmitElapsedSeconds,
-  setSubmitStartedAt,
   persistConversation,
-  syncQuotaAfterResult,
   updateConversation,
   resetComposer,
 }: UseImageSubmitOptions) {
-  const handleSelectionEditSubmit = useCallback(async ({
-    prompt,
-    mask,
-  }: {
-    prompt: string;
-    mask: {
-      file: File;
-      previewDataUrl: string;
-    };
-  }) => {
-    if (!editorTarget) {
-      return;
-    }
+  const isSelectionEditDispatchingRef = useRef(false);
+  const isSubmitDispatchingRef = useRef(false);
+  const retryingTurnIdsRef = useRef<Set<string>>(new Set());
 
-    const sourceReference = buildInpaintSourceReference(editorTarget.image);
-    const conversationId = editorTarget.conversationId;
-    const turnId = makeId();
-    const now = new Date().toISOString();
-    const draftTurn = createConversationTurn({
-      turnId,
-      title: buildConversationTitle("edit", prompt, upscaleScale),
-      mode: "edit",
+  const handleSelectionEditSubmit = useCallback(
+    async ({
       prompt,
-      model: imageModel,
-      count: 1,
-      sourceImages: [
-        {
-          id: makeId(),
-          role: "image",
-          name: editorTarget.imageName,
-          dataUrl: editorTarget.sourceDataUrl,
-        },
-        {
-          id: makeId(),
-          role: "mask",
-          name: "mask.png",
-          dataUrl: mask.previewDataUrl,
-        },
-      ],
-      images: createLoadingImages(1, turnId),
-      createdAt: now,
-      status: "generating",
-    });
+      mask,
+      aspectRatio: _aspectRatio,
+      resolutionTier: _resolutionTier,
+      quality: overrideQuality,
+    }: {
+      prompt: string;
+      mask: {
+        file: File;
+        previewDataUrl: string;
+      };
+      aspectRatio?: string;
+      resolutionTier?: string;
+      quality?: string;
+    }) => {
+      if (isSelectionEditDispatchingRef.current || !editorTarget) {
+        return;
+      }
+      isSelectionEditDispatchingRef.current = true;
 
-    const startedAt = Date.now();
-    setIsSubmitting(true);
-    setActiveRequest({
-      conversationId,
-      turnId,
-      mode: "edit",
-      count: 1,
-      variant: "selection-edit",
-    });
-    setSubmitElapsedSeconds(0);
-    setSubmitStartedAt(startedAt);
-    focusConversation(conversationId);
-    setImagePrompt("");
-    setSourceImages([]);
-    closeSelectionEditor();
-    startImageTask({
-      conversationId,
-      turnId,
-      mode: "edit",
-      count: 1,
-      variant: "selection-edit",
-      startedAt,
-    });
-
-    try {
-      await updateConversation(conversationId, (current) => {
-        if (!current) {
-          return buildConversationBase(conversationId, draftTurn);
-        }
-        return {
-          ...current,
-          turns: [...(current.turns ?? []), draftTurn],
-        };
+      const sourceReference = editorTarget.image
+        ? buildInpaintSourceReference(editorTarget.image)
+        : undefined;
+      const targetConversationId =
+        editorTarget.conversationId ?? selectedConversationId;
+      const conversationId = targetConversationId ?? makeId();
+      const supportsEditableOutputOptions = true;
+      const nextQuality = supportsEditableOutputOptions
+        ? normalizeImageQuality(overrideQuality, imageQuality)
+        : imageQuality;
+      const turnId = makeId();
+      const now = new Date().toISOString();
+      const draftTurn = createConversationTurn({
+        turnId,
+        title: buildConversationTitle("edit", prompt),
+        mode: "edit",
+        prompt,
+        model: imageModel,
+        count: 1,
+        size: supportsEditableOutputOptions ? imageSize : undefined,
+        resolutionAccess: supportsEditableOutputOptions
+          ? imageResolutionAccess
+          : undefined,
+        quality: supportsEditableOutputOptions ? nextQuality : undefined,
+        sourceImages: [
+          buildSourceReference({
+            id: makeId(),
+            role: "image",
+            name: editorTarget.imageName,
+            url: editorTarget.sourceDataUrl,
+          }),
+          {
+            id: makeId(),
+            role: "mask",
+            name: "mask.png",
+            dataUrl: mask.previewDataUrl,
+          },
+        ],
+        sourceReference,
+        images: createLoadingImages(1, turnId),
+        createdAt: now,
+        status: "queued",
       });
 
-      let fallbackImageFile = sourceReference
-        ? null
-        : await dataUrlToFile(editorTarget.sourceDataUrl, editorTarget.imageName || "source.png");
-      let data;
+      setSubmitElapsedSeconds(0);
+      focusConversation(conversationId);
+      setImagePrompt("");
+      setSourceImages([]);
+      closeSelectionEditor();
+
       try {
-        data = await editImage({
-          prompt,
-          images: fallbackImageFile ? [fallbackImageFile] : [],
-          mask: mask.file,
-          sourceReference,
-          model: imageModel,
-        });
-      } catch (error) {
-        if (!sourceReference || !shouldFallbackSelectionEdit(error)) {
-          throw error;
-        }
-        fallbackImageFile =
-          fallbackImageFile ??
-          (await dataUrlToFile(editorTarget.sourceDataUrl, editorTarget.imageName || "source.png"));
-        data = await editImage({
-          prompt,
-          images: [fallbackImageFile],
-          mask: mask.file,
-          model: imageModel,
-        });
-      }
-      const resultItems = mergeResultImages(turnId, data.data || [], 1);
-      syncQuotaAfterResult(resultItems);
-      const failedCount = countFailures(resultItems);
-
-      await updateConversation(conversationId, (current) => ({
-        ...(current ?? buildConversationBase(conversationId, draftTurn)),
-        turns: (current?.turns ?? [draftTurn]).map((turn) =>
-          turn.id === turnId
-            ? {
-                ...turn,
-                images: resultItems,
-                status: failedCount > 0 ? "error" : "success",
-                error: failedCount > 0 ? `其中 ${failedCount} 张处理失败` : undefined,
-              }
-            : turn,
-        ),
-      }));
-
-      if (failedCount > 0) {
-        toast.error(`已返回结果，但有 ${failedCount} 张处理失败`);
-      } else {
-        toast.success("图片已按选区编辑");
-      }
-    } catch (error) {
-      const message = formatImageError(error);
-      await updateConversation(conversationId, (current) => ({
-        ...(current ?? buildConversationBase(conversationId, draftTurn)),
-        turns: (current?.turns ?? [draftTurn]).map((turn) =>
-          turn.id === turnId
-            ? {
-                ...turn,
-                status: "error",
-                error: message,
-                images: turn.images.map((image) => ({
-                  ...image,
-                  status: "error" as const,
-                  error: message,
-                })),
-              }
-            : turn,
-        ),
-      }));
-      toast.error(message);
-    } finally {
-      finishImageTask(conversationId, turnId);
-      setIsSubmitting(false);
-      setActiveRequest(null);
-      setSubmitStartedAt(null);
-    }
-  }, [
-    closeSelectionEditor,
-    editorTarget,
-    focusConversation,
-    imageModel,
-    makeId,
-    setActiveRequest,
-    setImagePrompt,
-    setIsSubmitting,
-    setSourceImages,
-    setSubmitElapsedSeconds,
-    setSubmitStartedAt,
-    updateConversation,
-    upscaleScale,
-    syncQuotaAfterResult,
-  ]);
-
-  const handleRetryTurn = useCallback(async (conversationId: string, turn: ImageConversationTurn) => {
-    if (isSubmitting) {
-      toast.error("正在处理中，请稍后再试");
-      return;
-    }
-
-    const prompt = turn.prompt?.trim() ?? "";
-    const turnMode = turn.mode || "generate";
-    const turnSourceImages = Array.isArray(turn.sourceImages) ? turn.sourceImages : [];
-    const turnImageSources = turnSourceImages.filter((item) => item.role === "image");
-    const turnMaskSource = turnSourceImages.find((item) => item.role === "mask") ?? null;
-    const turnScale = turnMode === "upscale" ? turn.scale || "2x" : undefined;
-    const turnQuality = turn.quality || "high";
-    const expectedCount = Math.max(1, turn.count || 1);
-
-    if (turnMode === "generate" && !prompt) {
-      toast.error("该记录缺少提示词，无法重试");
-      return;
-    }
-    if ((turnMode === "edit" || turnMode === "upscale") && turnImageSources.length === 0) {
-      toast.error("该记录缺少源图，无法重试");
-      return;
-    }
-
-    const turnId = turn.id;
-    const now = new Date().toISOString();
-    const draftTurn = createConversationTurn({
-      turnId,
-      title: buildConversationTitle(turnMode, prompt, turnScale || upscaleScale),
-      mode: turnMode,
-      prompt,
-      model: turn.model,
-      count: expectedCount,
-      size: turn.size,
-      quality: turnMode === "generate" && turnImageSources.length === 0 ? turnQuality : undefined,
-      scale: turnScale,
-      sourceImages: turnSourceImages,
-      images: createLoadingImages(expectedCount, turnId),
-      createdAt: now,
-      status: "generating",
-    });
-
-    const startedAt = Date.now();
-    setIsSubmitting(true);
-    setActiveRequest({
-      conversationId,
-      turnId,
-      mode: turnMode,
-      count: expectedCount,
-      variant: "standard",
-    });
-    setSubmitElapsedSeconds(0);
-    setSubmitStartedAt(startedAt);
-    focusConversation(conversationId);
-    startImageTask({
-      conversationId,
-      turnId,
-      mode: turnMode,
-      count: expectedCount,
-      variant: "standard",
-      startedAt,
-    });
-
-    try {
-      await updateConversation(conversationId, (current) => ({
-        ...(current ?? buildConversationBase(conversationId, draftTurn)),
-        turns: current?.turns?.map((item) => (item.id === turnId ? draftTurn : item)) ?? [draftTurn],
-      }));
-
-      let resultItems: StoredImage[] = [];
-      if (turnMode === "generate") {
-        if (turnImageSources.length > 0) {
-          const files = await Promise.all(
-            turnImageSources.map((item, index) => dataUrlToFile(item.dataUrl, item.name || `reference-${index + 1}.png`)),
-          );
-          const data = await editImage({ prompt, images: files, model: turn.model });
-          resultItems = mergeResultImages(turnId, data.data || [], 1);
-        } else {
-          const data = await generateImageWithOptions(prompt, {
-            model: turn.model,
-            count: expectedCount,
-            size: turn.size,
-            quality: turnQuality,
+        if (targetConversationId) {
+          await updateConversation(conversationId, (current) => {
+            if (!current) {
+              return buildConversationBase(conversationId, draftTurn);
+            }
+            return {
+              ...current,
+              turns: [...(current.turns ?? []), draftTurn],
+            };
           });
-          resultItems = mergeResultImages(turnId, data.data || [], expectedCount);
+        } else {
+          await persistConversation(
+            buildConversationBase(conversationId, draftTurn),
+          );
         }
-      }
 
-      if (turnMode === "edit") {
-        const files = await Promise.all(
-          turnImageSources.map((item, index) => dataUrlToFile(item.dataUrl, item.name || `image-${index + 1}.png`)),
-        );
-        const mask = turnMaskSource ? await dataUrlToFile(turnMaskSource.dataUrl, turnMaskSource.name || "mask.png") : null;
-        const data = await editImage({ prompt, images: files, mask, model: turn.model });
-        resultItems = mergeResultImages(turnId, data.data || [], 1);
-      }
+        const result = await createImageTask({
+          conversationId,
+          turnId,
+          mode: "edit",
+          prompt,
+          model: imageModel,
+          count: 1,
+          size: supportsEditableOutputOptions ? imageSize : undefined,
+          resolutionAccess: supportsEditableOutputOptions
+            ? imageResolutionAccess
+            : undefined,
+          quality: supportsEditableOutputOptions ? nextQuality : undefined,
+          sourceImages: draftTurn.sourceImages,
+          sourceReference,
+        });
 
-      if (turnMode === "upscale") {
-        const file = await dataUrlToFile(turnImageSources[0].dataUrl, turnImageSources[0].name || "upscale.png");
-        const data = await upscaleImage({ image: file, prompt, scale: turnScale || "2x", model: turn.model });
-        resultItems = mergeResultImages(turnId, data.data || [], 1);
-      }
-
-      syncQuotaAfterResult(resultItems);
-      const failedCount = countFailures(resultItems);
-      await updateConversation(conversationId, (current) => ({
-        ...(current ?? buildConversationBase(conversationId, draftTurn)),
-        turns: (current?.turns ?? [draftTurn]).map((item) =>
-          item.id === turnId
-            ? {
-                ...item,
-                images: resultItems,
-                status: failedCount > 0 ? "error" : "success",
-                error: failedCount > 0 ? `其中 ${failedCount} 张处理失败` : undefined,
-              }
-            : item,
-        ),
-      }));
-
-      if (failedCount > 0) {
-        toast.error(`已返回结果，但有 ${failedCount} 张处理失败`);
-      } else {
-        toast.success(turnMode === "generate" ? "图片已生成" : turnMode === "edit" ? "图片已编辑" : "图片已放大");
-      }
-    } catch (error) {
-      const message = formatImageError(error);
-      await updateConversation(conversationId, (current) => ({
-        ...(current ?? buildConversationBase(conversationId, draftTurn)),
-        turns: (current?.turns ?? [draftTurn]).map((item) =>
-          item.id === turnId
-            ? {
-                ...item,
-                status: "error",
-                error: message,
-                images: item.images.map((image) => ({
-                  ...image,
-                  status: "error" as const,
+        await updateConversation(conversationId, (current) => ({
+          ...(current ?? buildConversationBase(conversationId, draftTurn)),
+          turns: (current?.turns ?? [draftTurn]).map((turn) =>
+            turn.id === turnId
+              ? {
+                  ...turn,
+                  taskId: result.task.id,
+                  queuePosition: result.task.queuePosition,
+                  waitingReason: result.task.waitingReason,
+                  waitingDetail: result.task.blockers?.[0]?.detail,
+                }
+              : turn,
+          ),
+        }));
+        toast.success("图片编辑任务已加入队列");
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "提交编辑失败";
+        await updateConversation(conversationId, (current) => ({
+          ...(current ?? buildConversationBase(conversationId, draftTurn)),
+          turns: (current?.turns ?? [draftTurn]).map((turn) =>
+            turn.id === turnId
+              ? {
+                  ...turn,
+                  status: "error",
                   error: message,
-                })),
-              }
-            : item,
-        ),
-      }));
-      toast.error(message);
-    } finally {
-      finishImageTask(conversationId, turnId);
-      setIsSubmitting(false);
-      setActiveRequest(null);
-      setSubmitStartedAt(null);
-    }
-  }, [
-    focusConversation,
-    isSubmitting,
-    setActiveRequest,
-    setIsSubmitting,
-    setSubmitElapsedSeconds,
-    setSubmitStartedAt,
-    syncQuotaAfterResult,
-    updateConversation,
-    upscaleScale,
-  ]);
+                  images: turn.images.map((image) => ({
+                    ...image,
+                    status: "error" as const,
+                    error: message,
+                  })),
+                }
+              : turn,
+          ),
+        }));
+        toast.error(message);
+      } finally {
+        isSelectionEditDispatchingRef.current = false;
+      }
+    },
+    [
+      closeSelectionEditor,
+      editorTarget,
+      focusConversation,
+      imageModel,
+      imageQuality,
+      imageResolutionAccess,
+      imageSize,
+      makeId,
+      persistConversation,
+      selectedConversationId,
+      setImagePrompt,
+      setSourceImages,
+      setSubmitElapsedSeconds,
+      updateConversation,
+    ],
+  );
+
+  const handleRetryTurn = useCallback(
+    async (
+      conversationId: string,
+      turn: ImageConversationTurn,
+      imageIndex?: number,
+    ) => {
+      if (retryingTurnIdsRef.current.has(turn.id)) {
+        return;
+      }
+
+      const prompt = turn.prompt?.trim() ?? "";
+      const turnMode = turn.mode || "generate";
+      const turnSourceImages = Array.isArray(turn.sourceImages)
+        ? turn.sourceImages
+        : [];
+      const turnImageSources = turnSourceImages.filter(
+        (item) => item.role === "image" && buildSourceImageUrl(item),
+      );
+      const turnQuality = turn.quality || "high";
+      const isSingleImageRetry =
+        turnMode === "generate" &&
+        typeof imageIndex === "number" &&
+        imageIndex >= 0 &&
+        (turn.count || 1) > 1;
+      const displayCount = Math.max(1, turn.count || 1);
+      const requestCount = isSingleImageRetry ? 1 : displayCount;
+      const retryTaskId = makeId();
+
+      if (turnMode === "generate" && !prompt) {
+        toast.error("该记录缺少提示词，无法重试");
+        return;
+      }
+      if (turnMode === "edit" && turnImageSources.length === 0) {
+        toast.error("该记录缺少源图，无法重试");
+        return;
+      }
+
+      retryingTurnIdsRef.current.add(turn.id);
+      const nextImages = isSingleImageRetry
+        ? turn.images.map((image, index) =>
+            index === imageIndex
+              ? {
+                  ...image,
+                  status: "loading" as const,
+                  error: undefined,
+                }
+              : image,
+          )
+        : createLoadingImages(requestCount, turn.id);
+      const draftTurn = createConversationTurn({
+        turnId: turn.id,
+        title: buildConversationTitle(turnMode, prompt),
+        mode: turnMode,
+        prompt,
+        model: turn.model,
+        count: displayCount,
+        size: turn.size,
+        resolutionAccess: turn.resolutionAccess,
+        quality: turnQuality,
+        sourceImages: turnSourceImages,
+        sourceReference: turn.sourceReference,
+        images: nextImages,
+        createdAt: new Date().toISOString(),
+        status: isSingleImageRetry ? "running" : "queued",
+      });
+
+      setSubmitElapsedSeconds(0);
+      focusConversation(conversationId);
+
+      try {
+        await updateConversation(conversationId, (current) => ({
+          ...(current ?? buildConversationBase(conversationId, draftTurn)),
+          turns:
+            current?.turns?.map((item) =>
+              item.id === turn.id ? draftTurn : item,
+            ) ?? [draftTurn],
+        }));
+
+        const result = await createImageTask({
+          taskId: retryTaskId,
+          conversationId,
+          turnId: turn.id,
+          mode: turnMode,
+          prompt,
+          model: turn.model,
+          count: requestCount,
+          retryImageIndex: isSingleImageRetry ? imageIndex : undefined,
+          size: turn.size,
+          resolutionAccess: turn.resolutionAccess,
+          quality: turnQuality,
+          sourceImages: turnSourceImages,
+          sourceReference: turn.sourceReference,
+        });
+
+        await updateConversation(conversationId, (current) => ({
+          ...(current ?? buildConversationBase(conversationId, draftTurn)),
+          turns: (current?.turns ?? [draftTurn]).map((item) =>
+            item.id === turn.id
+              ? {
+                  ...item,
+                  taskId: result.task.id,
+                  queuePosition: result.task.queuePosition,
+                  waitingReason: result.task.waitingReason,
+                  waitingDetail: result.task.blockers?.[0]?.detail,
+                  status: isSingleImageRetry ? "running" : item.status,
+                }
+              : item,
+          ),
+        }));
+        toast.success(
+          isSingleImageRetry ? "失败图片已重新加入队列" : "任务已重新加入队列",
+        );
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "提交任务失败";
+        await updateConversation(conversationId, (current) => ({
+          ...(current ?? buildConversationBase(conversationId, draftTurn)),
+          turns: (current?.turns ?? [draftTurn]).map((item) =>
+            item.id === turn.id
+              ? {
+                  ...item,
+                  status:
+                    isSingleImageRetry
+                      ? item.images.some(
+                          (image, index) =>
+                            index !== imageIndex && image.status === "loading",
+                        )
+                        ? "running"
+                        : "error"
+                      : "error",
+                  error: message,
+                  images: isSingleImageRetry
+                    ? item.images.map((image, index) =>
+                        index === imageIndex
+                          ? {
+                              ...image,
+                              status: "error" as const,
+                              error: message,
+                            }
+                          : image,
+                      )
+                    : item.images.map((image) => ({
+                        ...image,
+                        status: "error" as const,
+                        error: message,
+                      })),
+                }
+              : item,
+          ),
+        }));
+        toast.error(message);
+      } finally {
+        retryingTurnIdsRef.current.delete(turn.id);
+      }
+    },
+    [focusConversation, makeId, setSubmitElapsedSeconds, updateConversation],
+  );
 
   const handleSubmit = useCallback(async () => {
+    if (isSubmitDispatchingRef.current) {
+      return;
+    }
     const prompt = imagePrompt.trim();
     if (mode === "generate" && !prompt) {
       toast.error("请输入提示词");
@@ -470,53 +471,32 @@ export function useImageSubmit({
       toast.error("编辑模式需要提示词");
       return;
     }
-    if (mode === "upscale" && imageSources.length === 0) {
-      toast.error("放大模式需要一张源图");
-      return;
-    }
+    isSubmitDispatchingRef.current = true;
 
     const conversationId = selectedConversationId ?? makeId();
     const turnId = makeId();
-    const now = new Date().toISOString();
-    const expectedCount = mode === "generate" && imageSources.length === 0 ? parsedCount : 1;
+      const expectedCount =
+      mode === "generate" ? parsedCount : 1;
     const draftTurn = createConversationTurn({
       turnId,
-      title: buildConversationTitle(mode, prompt, upscaleScale),
+      title: buildConversationTitle(mode, prompt),
       mode,
       prompt,
       model: imageModel,
       count: expectedCount,
-      size: mode === "generate" ? imageSize : undefined,
-      quality: mode === "generate" && imageSources.length === 0 ? imageQuality : undefined,
-      scale: mode === "upscale" ? upscaleScale : undefined,
+      size: imageSize,
+      resolutionAccess: imageResolutionAccess,
+      quality: imageQuality,
       sourceImages,
       images: createLoadingImages(expectedCount, turnId),
-      createdAt: now,
-      status: "generating",
+      createdAt: new Date().toISOString(),
+      status: "queued",
     });
 
-    const startedAt = Date.now();
-    setIsSubmitting(true);
-    setActiveRequest({
-      conversationId,
-      turnId,
-      mode,
-      count: expectedCount,
-      variant: "standard",
-    });
     setSubmitElapsedSeconds(0);
-    setSubmitStartedAt(startedAt);
     focusConversation(conversationId);
     setImagePrompt("");
     setSourceImages([]);
-    startImageTask({
-      conversationId,
-      turnId,
-      mode,
-      count: expectedCount,
-      variant: "standard",
-      startedAt,
-    });
 
     try {
       if (selectedConversationId) {
@@ -525,75 +505,43 @@ export function useImageSubmit({
           turns: [...(current?.turns ?? []), draftTurn],
         }));
       } else {
-        await persistConversation(buildConversationBase(conversationId, draftTurn));
-      }
-
-      let resultItems: StoredImage[] = [];
-      if (mode === "generate") {
-        if (imageSources.length > 0) {
-          const files = await Promise.all(
-            imageSources.map((item, index) => dataUrlToFile(item.dataUrl, item.name || `reference-${index + 1}.png`)),
-          );
-          const data = await editImage({ prompt, images: files, model: imageModel });
-          resultItems = mergeResultImages(turnId, data.data || [], 1);
-        } else {
-          const data = await generateImageWithOptions(prompt, {
-            model: imageModel,
-            count: parsedCount,
-            size: imageSize,
-            quality: imageQuality,
-          });
-          resultItems = mergeResultImages(turnId, data.data || [], parsedCount);
-        }
-      }
-
-      if (mode === "edit") {
-        const files = await Promise.all(
-          imageSources.map((item, index) => dataUrlToFile(item.dataUrl, item.name || `image-${index + 1}.png`)),
+        await persistConversation(
+          buildConversationBase(conversationId, draftTurn),
         );
-        const mask = maskSource ? await dataUrlToFile(maskSource.dataUrl, maskSource.name || "mask.png") : null;
-        const data = await editImage({ prompt, images: files, mask, model: imageModel });
-        resultItems = mergeResultImages(turnId, data.data || [], 1);
       }
 
-      if (mode === "upscale") {
-        const file = await dataUrlToFile(imageSources[0].dataUrl, imageSources[0].name || "upscale.png");
-        const data = await upscaleImage({ image: file, prompt, scale: upscaleScale, model: imageModel });
-        resultItems = mergeResultImages(turnId, data.data || [], 1);
-      }
+      const result = await createImageTask({
+        conversationId,
+        turnId,
+        mode,
+        prompt,
+        model: imageModel,
+        count: expectedCount,
+        size: imageSize,
+        resolutionAccess: imageResolutionAccess,
+        quality: imageQuality,
+        sourceImages,
+      });
 
-      syncQuotaAfterResult(resultItems);
-      const failedCount = countFailures(resultItems);
       await updateConversation(conversationId, (current) => ({
         ...(current ?? buildConversationBase(conversationId, draftTurn)),
         turns: (current?.turns ?? [draftTurn]).map((turn) =>
           turn.id === turnId
             ? {
                 ...turn,
-                images: resultItems,
-                status: failedCount > 0 ? "error" : "success",
-                error: failedCount > 0 ? `其中 ${failedCount} 张处理失败` : undefined,
+                taskId: result.task.id,
+                queuePosition: result.task.queuePosition,
+                waitingReason: result.task.waitingReason,
+                waitingDetail: result.task.blockers?.[0]?.detail,
               }
             : turn,
         ),
       }));
-
-      resetComposer(mode === "generate" ? "generate" : mode);
-      if (failedCount > 0) {
-        toast.error(`已返回结果，但有 ${failedCount} 张处理失败`);
-      } else {
-        toast.success(
-          mode === "generate"
-            ? imageSources.length > 0
-              ? "参考图生成已完成"
-              : "图片已生成"
-            : mode === "edit"
-              ? "图片已编辑"
-              : "图片已放大",
-        );
-      }
+      resetComposer(mode === "generate" ? "generate" : "edit");
+      toast.success("图片任务已加入队列");
     } catch (error) {
-      const message = formatImageError(error);
+      const message =
+        error instanceof Error ? error.message : "提交任务失败";
       await updateConversation(conversationId, (current) => ({
         ...(current ?? buildConversationBase(conversationId, draftTurn)),
         turns: (current?.turns ?? [draftTurn]).map((turn) =>
@@ -613,10 +561,7 @@ export function useImageSubmit({
       }));
       toast.error(message);
     } finally {
-      finishImageTask(conversationId, turnId);
-      setIsSubmitting(false);
-      setActiveRequest(null);
-      setSubmitStartedAt(null);
+      isSubmitDispatchingRef.current = false;
     }
   }, [
     focusConversation,
@@ -624,24 +569,19 @@ export function useImageSubmit({
     imagePrompt,
     imageSources,
     makeId,
-    maskSource,
     mode,
     imageSize,
+    imageResolutionAccess,
     imageQuality,
     parsedCount,
     persistConversation,
     resetComposer,
     selectedConversationId,
-    setActiveRequest,
     setImagePrompt,
-    setIsSubmitting,
     setSourceImages,
     setSubmitElapsedSeconds,
-    setSubmitStartedAt,
     sourceImages,
-    syncQuotaAfterResult,
     updateConversation,
-    upscaleScale,
   ]);
 
   return {

@@ -1,9 +1,11 @@
+import webConfig from "@/constants/common-env";
 import { httpRequest } from "@/lib/request";
 
 export type AccountType = "Free" | "Plus" | "Pro" | "Team";
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
 export type ImageModel = "gpt-image-1" | "gpt-image-2";
 export type ImageQuality = "low" | "medium" | "high";
+export type ImageResolutionAccess = "free" | "paid";
 
 export type Account = {
   id: string;
@@ -119,6 +121,73 @@ export type ImageResponseItem = {
   conversation_id?: string;
   parent_message_id?: string;
   source_account_id?: string;
+  error?: string;
+};
+
+export type ImageTaskStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancel_requested"
+  | "cancelled"
+  | "expired";
+
+export type ImageTaskWaitingReason =
+  | ""
+  | "global_concurrency"
+  | "paid_account_busy"
+  | "compatible_account_busy"
+  | "source_account_busy"
+  | "retry_backoff";
+
+export type ImageTaskBlocker = {
+  code: string;
+  detail?: string;
+};
+
+export type ImageTaskView = {
+  id: string;
+  conversationId: string;
+  turnId: string;
+  mode: "generate" | "edit" | string;
+  status: ImageTaskStatus;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  count: number;
+  retryImageIndex?: number;
+  queuePosition?: number;
+  waitingReason?: ImageTaskWaitingReason;
+  blockers?: ImageTaskBlocker[];
+  images: ImageResponseItem[];
+  error?: string;
+  cancelRequested?: boolean;
+};
+
+export type ImageTaskSnapshot = {
+  running: number;
+  maxRunning: number;
+  queued: number;
+  total: number;
+  activeSources: {
+    workspace: number;
+    compat: number;
+  };
+  finalStatuses: {
+    succeeded: number;
+    failed: number;
+    cancelled: number;
+    expired: number;
+  };
+  retentionSeconds: number;
+};
+
+export type ImageTaskStreamEvent = {
+  type: string;
+  taskId?: string;
+  task?: ImageTaskView;
+  snapshot?: ImageTaskSnapshot;
 };
 
 export type InpaintSourceReference = {
@@ -132,6 +201,16 @@ export type InpaintSourceReference = {
 type ImageResponse = {
   created: number;
   data: ImageResponseItem[];
+};
+
+type ImageTaskListResponse = {
+  items: ImageTaskView[];
+  snapshot: ImageTaskSnapshot;
+};
+
+type ImageTaskResponse = {
+  task: ImageTaskView;
+  snapshot: ImageTaskSnapshot;
 };
 
 export type VersionInfo = {
@@ -304,6 +383,11 @@ export async function fetchConfig() {
     chatgpt: {
       imageMode: payload.workspace.image_mode,
       studioAllowDisabledImageAccounts: payload.workspace.allow_disabled_studio_accounts,
+      freeImageRoute: "legacy",
+    },
+    storage: {
+      imageConversationStorage: "browser" as const,
+      imageDataStorage: "browser" as const,
     },
   };
 }
@@ -343,6 +427,133 @@ export async function generateImageWithOptions(
       response_format: "b64_json",
     },
   });
+}
+
+export async function createImageTask(payload: {
+  taskId?: string;
+  conversationId: string;
+  turnId: string;
+  mode: "generate" | "edit";
+  prompt: string;
+  model?: ImageModel;
+  count?: number;
+  retryImageIndex?: number;
+  size?: string;
+  resolutionAccess?: ImageResolutionAccess;
+  quality?: ImageQuality;
+  sourceImages?: Array<{
+    id: string;
+    role: "image" | "mask";
+    name: string;
+    dataUrl?: string;
+    url?: string;
+  }>;
+  sourceReference?: InpaintSourceReference;
+}) {
+  return httpRequest<ImageTaskResponse>("/portal/api/image/tasks", {
+    method: "POST",
+    body: {
+      taskId: payload.taskId?.trim() || undefined,
+      conversationId: payload.conversationId,
+      turnId: payload.turnId,
+      mode: payload.mode,
+      prompt: payload.prompt,
+      model: payload.model ?? "gpt-image-2",
+      count: Math.max(1, payload.count ?? 1),
+      retryImageIndex:
+        typeof payload.retryImageIndex === "number"
+          ? payload.retryImageIndex
+          : undefined,
+      size: payload.size?.trim() || undefined,
+      resolutionAccess: payload.resolutionAccess,
+      quality: payload.quality,
+      sourceImages: payload.sourceImages ?? [],
+      sourceReference: payload.sourceReference,
+    },
+  });
+}
+
+export async function listImageTasks() {
+  return httpRequest<ImageTaskListResponse>("/portal/api/image/tasks");
+}
+
+export async function cancelImageTask(taskId: string) {
+  return httpRequest<ImageTaskResponse>(
+    `/portal/api/image/tasks/${encodeURIComponent(taskId)}`,
+    {
+      method: "DELETE",
+    },
+  );
+}
+
+export async function consumeImageTaskStream(
+  handlers: {
+    onInit: (payload: { items: ImageTaskView[]; snapshot: ImageTaskSnapshot }) => void;
+    onEvent: (event: ImageTaskStreamEvent) => void;
+  },
+  signal: AbortSignal,
+) {
+  const response = await fetch(
+    `${webConfig.apiUrl.replace(/\/$/, "")}/portal/api/image/tasks/stream`,
+    {
+      method: "GET",
+      credentials: "include",
+      signal,
+    },
+  );
+  if (!response.ok || !response.body) {
+    throw new Error(`task stream failed (${response.status})`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let eventType = "message";
+  let dataLines: string[] = [];
+
+  const flushEvent = () => {
+    if (dataLines.length === 0) {
+      eventType = "message";
+      return;
+    }
+    const raw = dataLines.join("\n");
+    try {
+      if (eventType === "init") {
+        handlers.onInit(JSON.parse(raw) as { items: ImageTaskView[]; snapshot: ImageTaskSnapshot });
+      } else {
+        handlers.onEvent(JSON.parse(raw) as ImageTaskStreamEvent);
+      }
+    } catch {
+      // Ignore malformed SSE payloads and keep the stream alive.
+    }
+    eventType = "message";
+    dataLines = [];
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      flushEvent();
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (line === "") {
+        flushEvent();
+        continue;
+      }
+      if (line.startsWith("event:")) {
+        eventType = line.slice("event:".length).trim();
+        continue;
+      }
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice("data:".length).trimStart());
+      }
+    }
+  }
 }
 
 export async function editImage({

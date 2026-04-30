@@ -29,6 +29,22 @@ export default function App() {
           }
         />
         <Route
+          path="/image/history"
+          element={
+            <RequirePortalAuth>
+              <ImagePage />
+            </RequirePortalAuth>
+          }
+        />
+        <Route
+          path="/image/workspace"
+          element={
+            <RequirePortalAuth>
+              <ImagePage />
+            </RequirePortalAuth>
+          }
+        />
+        <Route
           path="/works"
           element={
             <RequirePortalAuth>

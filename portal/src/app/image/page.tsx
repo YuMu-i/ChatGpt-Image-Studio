@@ -1,73 +1,121 @@
 "use client";
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "react-medium-image-zoom/dist/styles.css";
-import Zoom from "react-medium-image-zoom";
-import {
-  ArrowUp,
-  Clock3,
-  Copy,
-  Download,
-  History,
-  ImagePlus,
-  LoaderCircle,
-  PanelLeftClose,
-  PanelLeftOpen,
-  RotateCcw,
-  Sparkles,
-  Trash2,
-  Upload,
-  Wand2,
-} from "lucide-react";
+import { ChevronsDown } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
-import { AppImage as Image } from "@/components/app-image";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { ImageEditModal } from "@/components/image-edit-modal";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
-import {
-  editImage,
+  cancelImageTask,
+  consumeImageTaskStream,
   fetchAccountQuota,
-  fetchPortalWorkspaceBootstrap,
-  generateImageWithOptions,
-  publishPortalGalleryWork,
-  upscaleImage,
+  fetchAccounts,
+  fetchConfig,
+  listImageTasks,
   type Account,
+  type ImageTaskSnapshot,
+  type ImageTaskView,
   type ImageQuality,
-  type PortalAccountQuotaResponse,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import {
-  buildGalleryPublishRecordKey,
-  listGalleryPublishRecords,
-  saveGalleryPublishRecord,
-} from "@/store/gallery-publish-records";
-import {
-  deleteImageConversation,
-  listImageConversations,
   normalizeConversation,
   saveImageConversation,
   updateImageConversation,
+  type ImageConversationStatus,
   type ImageConversation,
   type ImageConversationTurn,
   type ImageMode,
   type StoredImage,
-  type StoredSourceImage,
 } from "@/store/image-conversations";
+import { ConversationTurns } from "./components/conversation-turns";
+import { EmptyState } from "./components/empty-state";
+import { HistorySidebar } from "./components/history-sidebar";
+import { PromptComposer } from "./components/prompt-composer";
 import {
-  finishImageTask,
-  isImageTaskActive,
-  listActiveImageTasks,
-  startImageTask,
-  subscribeImageTasks,
-} from "@/store/image-active-tasks";
+  buildActiveRequestState,
+  buildEmptyTaskSnapshot,
+  deriveTaskSnapshotFromItems,
+  type ActiveRequestState,
+  reduceTaskItems,
+  selectConversationActiveTask,
+} from "./task-runtime";
+import { WorkspaceHeader } from "./components/workspace-header";
+import { useImageHistory } from "./hooks/use-image-history";
+import { useImageSourceInputs } from "./hooks/use-image-source-inputs";
+import { useImageSubmit } from "./hooks/use-image-submit";
+import { buildConversationPreviewSource } from "./view-utils";
+
+type ImageAspectRatio = "auto" | "1:1" | "4:3" | "3:2" | "16:9" | "21:9" | "9:16";
+type ImageResolutionTier = "auto-free" | "auto-paid" | "sd" | "2k" | "4k";
+type ImageResolutionAccess = "free" | "paid";
+type ImageResolutionPreset = {
+  tier: ImageResolutionTier;
+  label: string;
+  value: string;
+  access: ImageResolutionAccess;
+};
+
+const imageAspectRatioOptions: Array<{
+  label: string;
+  value: ImageAspectRatio;
+}> = [
+  { label: "Auto", value: "auto" },
+  { label: "1:1", value: "1:1" },
+  { label: "4:3", value: "4:3" },
+  { label: "3:2", value: "3:2" },
+  { label: "16:9", value: "16:9" },
+  { label: "21:9", value: "21:9" },
+  { label: "9:16", value: "9:16" },
+];
+
+const imageAutoResolutionPresets: ImageResolutionPreset[] = [
+  { tier: "auto-free", label: "Free（提示词指定）", value: "", access: "free" },
+  { tier: "auto-paid", label: "Paid（提示词指定）", value: "", access: "paid" },
+];
+
+const imageResolutionPresets: Record<
+  Exclude<ImageAspectRatio, "auto">,
+  ImageResolutionPreset[]
+> = {
+  "1:1": [
+    { tier: "sd", label: "Free 实际档", value: "1248x1248", access: "free" },
+    { tier: "2k", label: "Paid 2K", value: "2048x2048", access: "paid" },
+    {
+      tier: "4k",
+      label: "Paid 高像素上限",
+      value: "2880x2880",
+      access: "paid",
+    },
+  ],
+  "4:3": [
+    { tier: "sd", label: "Free 实际档", value: "1440x1072", access: "free" },
+    { tier: "2k", label: "Paid 2K", value: "2048x1536", access: "paid" },
+    { tier: "4k", label: "Paid 高像素", value: "3264x2448", access: "paid" },
+  ],
+  "3:2": [
+    { tier: "sd", label: "Free 实际档", value: "1536x1024", access: "free" },
+    { tier: "2k", label: "Paid 2K", value: "2160x1440", access: "paid" },
+    { tier: "4k", label: "Paid 高像素", value: "3456x2304", access: "paid" },
+  ],
+  "16:9": [
+    { tier: "sd", label: "Free 实际档", value: "1664x928", access: "free" },
+    { tier: "2k", label: "Paid 2K", value: "2560x1440", access: "paid" },
+    { tier: "4k", label: "Paid 4K", value: "3840x2160", access: "paid" },
+  ],
+  "21:9": [
+    { tier: "sd", label: "Free 实际档", value: "1904x816", access: "free" },
+    { tier: "2k", label: "Paid 2K", value: "3360x1440", access: "paid" },
+    { tier: "4k", label: "Paid 高像素", value: "3808x1632", access: "paid" },
+  ],
+  "9:16": [
+    { tier: "sd", label: "Free 实际档", value: "928x1664", access: "free" },
+    { tier: "2k", label: "Paid 2K", value: "1440x2560", access: "paid" },
+    { tier: "4k", label: "Paid 4K", value: "2160x3840", access: "paid" },
+  ],
+};
 
 const modeOptions: Array<{
   label: string;
@@ -77,167 +125,87 @@ const modeOptions: Array<{
   {
     label: "生成",
     value: "generate",
-    description: "输入提示词生成新图，也可上传参考图辅助生成",
+    description: "提示词生成新图，也可上传参考图辅助生成",
   },
-  {
-    label: "编辑",
-    value: "edit",
-    description: "上传图像后整体或局部改图",
-  },
-  {
-    label: "放大",
-    value: "upscale",
-    description: "提升清晰度并增强细节",
-  },
+  { label: "编辑", value: "edit", description: "上传图像后局部或整体改图" },
 ];
-
-const sizeOptions = [
-  { value: "1024x1024", label: "1:1 标准" },
-  { value: "1536x1024", label: "3:2 横向" },
-  { value: "1024x1536", label: "2:3 纵向" },
-];
-
-const qualityOptions: Array<{
-  value: ImageQuality;
+const imageQualityOptions: Array<{
   label: string;
+  value: ImageQuality;
   description: string;
 }> = [
-  { value: "low", label: "Low", description: "低质量，适合草稿测试" },
-  { value: "medium", label: "Medium", description: "均衡质量与速度" },
-  { value: "high", label: "High", description: "高质量，适合最终出图" },
-];
-
-const upscaleOptions = ["2x", "4x"];
-
-const inspirationExamples = [
+  { label: "Low", value: "low", description: "低质量，速度更快，适合草稿测试" },
   {
-    id: "portrait-editorial",
-    title: "电影感人物海报",
-    prompt: "一位站在雨夜霓虹街头的女性主角，电影海报质感，浅景深，潮湿空气，橙蓝对比光，细节丰富",
-    hint: "适合测试人物主视觉和电影感光影。",
-    tone: "from-slate-950 via-indigo-900 to-amber-500",
+    label: "Medium",
+    value: "medium",
+    description: "均衡质量与速度，适合日常生成",
   },
   {
-    id: "interior-design",
-    title: "室内空间概念图",
-    prompt: "现代侘寂风客厅，清晨斜射光，原木、石材与亚麻织物，构图克制，高级家居杂志风格",
-    hint: "适合空间、家居与商业提案展示。",
-    tone: "from-stone-900 via-stone-700 to-neutral-300",
-  },
-  {
-    id: "product-macro",
-    title: "产品特写广告图",
-    prompt: "高端护肤瓶置于雾面金属台座，微距镜头，柔雾体积光，极简高级广告视觉，背景留白",
-    hint: "适合品牌视觉、电商主图和材质测试。",
-    tone: "from-zinc-950 via-zinc-700 to-rose-200",
-  },
-  {
-    id: "fantasy-landscape",
-    title: "奇幻场景设定图",
-    prompt: "悬浮山脉之间的古代空中神殿，金色日落云海，史诗感构图，概念设定图风格",
-    hint: "适合世界观、游戏和影视概念图。",
-    tone: "from-emerald-950 via-teal-700 to-amber-300",
+    label: "High",
+    value: "high",
+    description: "高质量，耗时更长，适合最终出图",
   },
 ];
 
 const modeLabelMap: Record<ImageMode, string> = {
   generate: "生成",
   edit: "编辑",
-  upscale: "放大",
 };
 
-type WorkspaceConfig = {
-  allowDisabledStudioAccounts: boolean;
-};
+function formatResolutionLabel(value: string) {
+  return value.replace("x", " x ");
+}
 
-type ActiveRequestState = {
-  conversationId: string;
-  turnId: string;
-  mode: ImageMode;
-  count: number;
-  variant: "standard" | "selection-edit";
-};
-
-type HistorySidebarProps = {
-  conversations: ImageConversation[];
-  selectedConversationId: string | null;
-  isLoadingHistory: boolean;
-  hasActiveTasks: boolean;
-  activeConversationIds: Set<string>;
-  onCreateDraft: () => void;
-  onClearHistory: () => Promise<void>;
-  onFocusConversation: (id: string) => void;
-  onDeleteConversation: (id: string) => Promise<void>;
-};
-
-type WorkspaceHeaderProps = {
-  historyCollapsed: boolean;
-  selectedConversationTitle?: string | null;
-  onToggleHistory: () => void;
-};
-
-type ProcessingStatus = {
+const inspirationExamples: Array<{
+  id: string;
   title: string;
-  detail: string;
-};
-
-type ConversationTurnsProps = {
-  conversationId: string;
-  turns: ImageConversationTurn[];
-  activeRequest: ActiveRequestState | null;
-  isSubmitting: boolean;
-  processingStatus: ProcessingStatus | null;
-  waitingDots: string;
-  submitElapsedSeconds: number;
-  publishedImageKeys: Set<string>;
-  publishingImageKey: string | null;
-  onSeedFromResult: (conversationId: string, image: StoredImage, nextMode: ImageMode) => void;
-  onPublishImage: (conversationId: string, turn: ImageConversationTurn, image: StoredImage) => Promise<void>;
-  onRetryTurn: (conversationId: string, turn: ImageConversationTurn) => Promise<void>;
-};
-
-type PromptComposerProps = {
-  mode: ImageMode;
-  imageCount: string;
-  imageSize: string;
-  imageQuality: ImageQuality;
-  upscaleScale: string;
-  availableQuota: string;
-  sourceImages: StoredSourceImage[];
-  imagePrompt: string;
-  hasGenerateReferences: boolean;
-  isSubmitting: boolean;
-  textareaRef: React.RefObject<HTMLTextAreaElement | null>;
-  uploadInputRef: React.RefObject<HTMLInputElement | null>;
-  maskInputRef: React.RefObject<HTMLInputElement | null>;
-  onModeChange: (mode: ImageMode) => void;
-  onImageCountChange: (value: string) => void;
-  onImageSizeChange: (value: string) => void;
-  onImageQualityChange: (value: ImageQuality) => void;
-  onUpscaleScaleChange: (value: string) => void;
-  onPromptChange: (value: string) => void;
-  onPromptPaste: (event: ReactClipboardEvent<HTMLTextAreaElement>) => void;
-  onRemoveSourceImage: (id: string) => void;
-  onAppendFiles: (files: FileList | null, role: "image" | "mask") => Promise<void>;
-  onMobileCollapsedChange: (collapsed: boolean) => void;
-  onSubmit: () => Promise<void>;
-};
-
-function sortConversations(items: ImageConversation[]) {
-  return [...items].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-}
-
-function makeId() {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
+  prompt: string;
+  hint: string;
+  count: number;
+  tone: string;
+}> = [
+  {
+    id: "stellar-poster",
+    title: "卡芙卡轮廓宇宙海报",
+    prompt:
+      "请根据【主题：崩坏星穹铁道，角色卡芙卡】自动生成一张高审美的“轮廓宇宙 / 收藏版叙事海报”风格作品。不要将画面局限于固定器物或常见容器，不要优先默认瓶子、沙漏、玻璃罩、怀表之类的常规载体，而是由 AI 根据主题自行判断并选择一个最契合、最有象征意义、轮廓最强、最适合承载完整叙事世界的主轮廓载体。这个主轮廓可以是器物、建筑、门、塔、拱门、穹顶、楼梯井、长廊、雕像、侧脸、眼睛、手掌、头骨、羽翼、面具、镜面、王座、圆环、裂缝、光幕、阴影、几何结构、空间切面、舞台框景、抽象符号或其他更有创意与主题代表性的视觉轮廓，要求合理布局。优先选择最能放大主题气质、最能形成强烈视觉记忆点、最能体现史诗感、神秘感、诗意感或设计感的轮廓，而不是最安全、最普通、最常见的容器。画面的核心不是简单把世界装进某个物体里，而是让完整的主题世界自然生长在这个主轮廓之中、之内、之上、之边界里或与其结构融为一体，形成一种“主题宇宙依附于一个象征性轮廓展开”的高级叙事效果。主轮廓必须清晰、优雅、有辨识度，并在整体构图中占据核心地位。轮廓内部或边界中需要自动生成与主题强绑定的完整叙事世界，内容应当丰富、饱满、层次清晰，包括最能代表主题的标志性场景、核心建筑或空间结构、象征符号与隐喻元素、角色关系或文明痕迹、远景中景近景的空间递进、具有命运感和情绪张力的氛围层次，以及门、台阶、桥梁、水面、烟雾、路径、光源、遗迹、机械结构、自然景观、抽象形态、生物或道具等叙事细节。所有元素必须统一、自然、有主次、有层级地融合，像一个完整世界真实孕育在这个轮廓结构之中，而不是简单拼贴、裁切填充、素材堆叠或模板化背景。整体构图需要具有强烈的收藏版海报气质与高级设计感，大结构稳定，主轮廓强烈明确，内部世界具有纵深、秩序和呼吸感，细节丰富但不拥挤，内容丰满但不杂乱，可以适度加入小比例人物剪影、远处建筑、光柱、门洞、桥、阶梯、回廊、倒影、天光或远景结构来增强尺度感、故事感与史诗感。整体画面要安静、宏大、凝练、富有余味，不要平均铺满，不要廉价热闹，不要无重点堆砌。风格融合收藏版电影海报构图、高级叙事型视觉设计、梦幻水彩质感与纸张印刷品气质，强调纸张颗粒感、边缘飞白、水彩刷痕、轻微晕染、空气透视、柔和雾化、局部体积光、光雾穿透、大面积留白与克制版式，让画面看起来像设计师完成的高端收藏版视觉作品，而不是普通 AI 跑图。整体气质要高级、诗意、宏大、神圣、怀旧、安静、具有传说感和叙事感。色彩由 AI 根据主题自动判断并匹配最合适的高级配色方案，但必须保持统一、克制、耐看、低饱和、高级，不要杂乱高饱和，不要廉价霓虹感，不要塑料数码感。配色可以围绕黑金灰、冷蓝灰、雾白灰、褐红米白、暗铜、旧纸色、深海蓝、暮色紫、银灰等体系自由变化，但必须始终服务主题，并保持海报级审美与整体和谐。最终要求：第一眼有强烈的主题识别度和轮廓记忆点，第二眼有完整丰富的叙事世界，第三眼仍有细节和余味。轮廓选择必须具有创意和主题匹配度，尽量避免重复、保守、常见的容器套路，优先选择更有象征性、更有空间感、更有设计潜力的轮廓形式。不要普通背景拼接，不要生硬裁切，不要模板化奇幻素材，不要游戏宣传图感，不要过度卡通化，不要过度写实导致失去艺术感，不要形式大于内容。如果合适，可以自然加入低调克制的标题、编号、签名或落款，让它更像收藏版海报设计的一部分，但不要喧宾夺主。",
+    hint: "适合高审美叙事海报、角色宇宙主题视觉、收藏版概念海报。",
+    count: 1,
+    tone: "from-[#17131f] via-[#4c2d45] to-[#b79b8b]",
+  },
+  {
+    id: "qinghua-museum-infographic",
+    title: "青花瓷博物馆图鉴",
+    prompt:
+      "请根据“青花瓷”自动生成一张“博物馆图鉴式中文拆解信息图”。要求整张图兼具真实写实主视觉、结构拆解、中文标注、材质说明、纹样寓意、色彩含义和核心特征总结。你需要根据主题自动判断最合适的主体对象、服饰体系、器物结构、时代风格、关键部件、材质工艺、颜色方案与版式结构，用户无需再提供其他信息。整体风格应为：国家博物馆展板、历史服饰图鉴、文博专题信息图，而不是普通海报、古风写真、电商详情页或动漫插画。背景采用米白、绢纸白、浅茶色等纸张质感，整体高级、克制、专业、可收藏。版式固定为：顶部：中文主标题 + 副标题 + 导语；左侧：结构拆解区，中文引线标注关键部件，并配局部特写；右上：材质 / 工艺 / 质感区，展示真实纹理小样并附说明；右中：纹样 / 色彩 / 寓意区，展示主色板、纹样样本和文化解释；底部：穿着顺序 / 构成流程图 + 核心特征总结。若主题适合人物展示，则以真实人物全身站姿为中央主体；若更适合器物或单体结构，则改为中心主体拆解图，但整体仍保持完整中文信息图形式。所有文字必须为简体中文，清晰、规整、可读，不要乱码、错字、英文或拼音。重点突出真实结构、材质差异、文化说明与图鉴气质。避免：海报感、影楼感、电商感、动漫感、cosplay感、乱标注、错结构、糊字、假材质、过度装饰。",
+    hint: "适合文博专题、器物拆解、中文信息图和展板式视觉。",
+    count: 1,
+    tone: "from-[#0d2f5f] via-[#3a6ea5] to-[#e7dcc4]",
+  },
+  {
+    id: "editorial-fashion",
+    title: "周芷若联动宣传图",
+    prompt:
+      "《倚天屠龙记》周芷若的维秘联动活动宣传图，人物占画面 80% 以上，周芷若在古风古城城墙上，优雅侧身回眸姿态，突出古典美人身姿曲线， 穿着维秘联动款：融合古风元素的蕾丝吊带裙，搭配精致吊带丝袜（黑色或淡青色，带有轻微古风刺绣），丝袜包裹修长双腿，整体造型唯美古典， 高品质真人级 3D 古风游戏截图风格，电影级光影，周芷若清丽绝俗、长发微散，眼神柔美回眸，轻纱飘逸， 背景为夜晚古城墙，青砖城垛、灯笼照明、月光洒落，古建筑灯火点点，氛围梦幻唯美， 高细节，8K 品质，精致渲染，真实丝袜质感，电影级构图，光影细腻，古典武侠风",
+    hint: "适合古风角色联动、游戏活动主视觉、电影感人物宣传图。",
+    count: 1,
+    tone: "from-zinc-900 via-rose-800 to-amber-500",
+  },
+  {
+    id: "forza-horizon-shenzhen",
+    title: "地平线 8 深圳实机图",
+    prompt:
+      "创作一张图片为《极限竞速 地平线 8》的游戏实机截图，游戏背景设为中国，背景城市为深圳，时间设定为 2028 年。画面需要体现真实次世代开放世界赛车游戏的实机演出效果，包含具有深圳辨识度的城市天际线、现代高楼、道路环境、灯光氛围与速度感。构图中在合适位置放置《极限竞速 地平线 8》的 logo 及宣传文案，整体像官方概念宣传截图而不是普通海报。要求 8K 超高清，电影级光影，真实车辆材质、反射、路面细节与空气透视，画面高级、震撼、写实。",
+    hint: "适合游戏主视觉、次世代赛车截图、城市宣传感概念图。",
+    count: 1,
+    tone: "from-slate-950 via-cyan-900 to-orange-500",
+  },
+];
 
 function formatConversationTime(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
-    return value;
+    return "";
   }
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
@@ -245,6 +213,118 @@ function formatConversationTime(value: string) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
+}
+
+function formatAvailableQuota(accounts: Account[], allowDisabled: boolean) {
+  const availableAccounts = accounts.filter((account) =>
+    isImageAccountUsable(account, allowDisabled),
+  );
+  return String(
+    availableAccounts.reduce(
+      (sum, account) => sum + getImageRemaining(account),
+      0,
+    ),
+  );
+}
+
+function getImageRemaining(account: Account) {
+  const limit = account.limits_progress?.find(
+    (item) => item.feature_name === "image_gen",
+  );
+  if (typeof limit?.remaining === "number") {
+    return Math.max(0, limit.remaining);
+  }
+  return Math.max(0, account.quota);
+}
+
+function mergeImageGenLimit(
+  limitsProgress: Account["limits_progress"],
+  remaining: number | null | undefined,
+  resetAfter: string | null | undefined,
+) {
+  const existing = limitsProgress ?? [];
+  const nextItem = {
+    feature_name: "image_gen",
+    remaining: typeof remaining === "number" ? remaining : undefined,
+    reset_after: resetAfter || undefined,
+  };
+
+  if (!existing.some((item) => item.feature_name === "image_gen")) {
+    return [...existing, nextItem];
+  }
+  return existing.map((item) =>
+    item.feature_name === "image_gen" ? { ...item, ...nextItem } : item,
+  );
+}
+
+function applyQuotaResultToAccount(
+  account: Account,
+  quota: Awaited<ReturnType<typeof fetchAccountQuota>>,
+): Account {
+  return {
+    ...account,
+    status: quota.status,
+    type: quota.type,
+    quota: quota.quota,
+    restoreAt: quota.image_gen_reset_after || account.restoreAt,
+    limits_progress: mergeImageGenLimit(
+      account.limits_progress,
+      quota.image_gen_remaining,
+      quota.image_gen_reset_after,
+    ),
+  };
+}
+
+function isImageAccountUsable(account: Account, allowDisabled: boolean) {
+  const disabled = Boolean(account.disabled) || account.status === "禁用";
+  return (
+    (!disabled || allowDisabled) &&
+    account.status !== "异常" &&
+    account.status !== "限流" &&
+    getImageRemaining(account) > 0
+  );
+}
+
+function hasAvailablePaidImageAccount(
+  accounts: Account[],
+  allowDisabled: boolean,
+) {
+  return accounts.some(
+    (account) =>
+      isImageAccountUsable(account, allowDisabled) &&
+      (account.type === "Plus" ||
+        account.type === "Pro" ||
+        account.type === "Team"),
+  );
+}
+
+function hasUsableFreeLegacyAccount(
+  accounts: Account[],
+  allowDisabled: boolean,
+  imageMode: "studio" | "cpa",
+  freeImageRoute: string,
+) {
+  if (imageMode !== "studio" || freeImageRoute !== "legacy") {
+    return false;
+  }
+  return accounts.some(
+    (account) =>
+      isImageAccountUsable(account, allowDisabled) &&
+      account.type !== "Plus" &&
+      account.type !== "Pro" &&
+      account.type !== "Team",
+  );
+}
+
+async function normalizeConversationHistory(items: ImageConversation[]) {
+  return items.map((item) => normalizeConversation(item));
+}
+
+function makeId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function formatProcessingDuration(totalSeconds: number) {
@@ -260,1754 +340,594 @@ function buildWaitingDots(totalSeconds: number) {
   return ".".repeat((totalSeconds % 3) + 1);
 }
 
-function buildProcessingStatus(mode: ImageMode, elapsedSeconds: number, count: number) {
-  if (mode === "generate") {
-    if (elapsedSeconds < 4) {
-      return { title: "正在提交生成请求", detail: `已进入图像生成队列，本次目标 ${count} 张` };
-    }
-    if (elapsedSeconds < 12) {
-      return { title: "正在排队创建画面", detail: "模型正在准备构图与风格细节" };
-    }
-    return { title: "模型正在生成图片", detail: "通常需要 20 到 90 秒，请保持页面开启" };
+function mapTaskStatusToTurnStatus(status: string): ImageConversationStatus {
+  switch (status) {
+    case "queued":
+      return "queued";
+    case "running":
+    case "cancel_requested":
+      return "running";
+    case "cancelled":
+      return "cancelled";
+    case "failed":
+    case "expired":
+      return "error";
+    case "succeeded":
+      return "success";
+    default:
+      return "success";
   }
-  if (mode === "edit") {
-    if (elapsedSeconds < 4) {
-      return { title: "正在提交编辑请求", detail: "请求已发送，正在准备处理素材" };
-    }
-    if (elapsedSeconds < 12) {
-      return { title: "正在上传编辑素材", detail: "素材上传完成后会进入改图阶段" };
-    }
-    return { title: "模型正在编辑图片", detail: "通常需要 20 到 90 秒，请保持页面开启" };
-  }
-  if (elapsedSeconds < 4) {
-    return { title: "正在提交放大请求", detail: "请求已发送，正在准备放大素材" };
-  }
-  if (elapsedSeconds < 12) {
-    return { title: "正在上传待放大图片", detail: "素材上传完成后会进入增强阶段" };
-  }
-  return { title: "模型正在放大图片", detail: "通常需要 20 到 90 秒，请保持页面开启" };
 }
 
-function buildConversationTitle(mode: ImageMode, prompt: string, scale = "") {
-  const prefix = mode === "generate" ? "生成" : mode === "edit" ? "编辑" : "放大";
-  const trimmed = prompt.trim();
-  if (!trimmed) {
-    return scale ? `${prefix} · ${scale}` : `${prefix} · 图片任务`;
-  }
-  return `${prefix} · ${trimmed.slice(0, 24)}`;
-}
-
-function buildGalleryWorkPrompt(turn: ImageConversationTurn) {
-  const prompt = turn.prompt.trim();
-  if (prompt) {
-    return prompt;
-  }
-  return `${modeLabelMap[turn.mode]}作品`;
-}
-
-function buildGalleryWorkTitle(turn: ImageConversationTurn) {
-  const prompt = buildGalleryWorkPrompt(turn);
-  return prompt.length > 24 ? `${prompt.slice(0, 24)}...` : prompt;
-}
-
-function getImageRemaining(account: Account) {
-  const limit = account.limits_progress?.find((item) => item.feature_name === "image_gen");
-  if (typeof limit?.remaining === "number") {
-    return Math.max(0, limit.remaining);
-  }
-  return Math.max(0, account.quota);
-}
-
-function isImageAccountUsable(account: Account, allowDisabled: boolean) {
-  const disabled = Boolean(account.disabled) || account.status === "禁用";
-  return (!disabled || allowDisabled) && account.status !== "异常" && account.status !== "限流" && getImageRemaining(account) > 0;
-}
-
-function formatAvailableQuota(accounts: Account[], allowDisabled: boolean) {
-  return String(accounts.filter((item) => isImageAccountUsable(item, allowDisabled)).reduce((sum, item) => sum + getImageRemaining(item), 0));
-}
-
-function mergeImageGenLimit(
-  limitsProgress: Account["limits_progress"],
-  remaining: number | null | undefined,
-  resetAfter: string | null | undefined,
-) {
-  const next = Array.isArray(limitsProgress) ? [...limitsProgress] : [];
-  const currentIndex = next.findIndex((item) => item.feature_name === "image_gen");
-  const nextItem = {
-    feature_name: "image_gen",
-    remaining: typeof remaining === "number" ? remaining : undefined,
-    reset_after: resetAfter || undefined,
-  };
-
-  if (currentIndex >= 0) {
-    next[currentIndex] = {
-      ...next[currentIndex],
-      ...nextItem,
-    };
-    return next;
-  }
-
-  next.push(nextItem);
-  return next;
-}
-
-function applyQuotaResultToAccount(account: Account, quota: PortalAccountQuotaResponse): Account {
-  return {
-    ...account,
-    status: quota.status,
-    type: quota.type,
-    quota: quota.quota,
-    restoreAt: quota.image_gen_reset_after || account.restoreAt,
-    limits_progress: mergeImageGenLimit(account.limits_progress, quota.image_gen_remaining, quota.image_gen_reset_after),
-  };
-}
-
-function createLoadingImages(count: number, turnId: string): StoredImage[] {
-  return Array.from({ length: count }, (_, index) => ({
-    id: `${turnId}-${index + 1}`,
-    status: "loading",
+function mapTaskImagesToStoredImages(images: ImageTaskView["images"]): StoredImage[] {
+  return images.map((image, index) => ({
+    id: image.file_id || image.gen_id || `task-image-${index}`,
+    status:
+      image.error && !image.b64_json && !image.url
+        ? "error"
+        : image.b64_json || image.url
+          ? "success"
+          : "loading",
+    b64_json: image.b64_json,
+    url: image.url,
+    revised_prompt: image.revised_prompt,
+    file_id: image.file_id,
+    gen_id: image.gen_id,
+    conversation_id: image.conversation_id,
+    parent_message_id: image.parent_message_id,
+    source_account_id: image.source_account_id,
+    error: image.error,
   }));
 }
 
-function buildConversationBase(conversationId: string, draftTurn: ImageConversationTurn): ImageConversation {
+function mergeRetryImageResult(
+  currentImages: StoredImage[],
+  taskImages: StoredImage[],
+  retryImageIndex: number,
+) {
+  if (retryImageIndex < 0) {
+    return currentImages;
+  }
+  return currentImages.map((image, index) =>
+    index === retryImageIndex ? (taskImages[0] ?? image) : image,
+  );
+}
+
+function isActiveImageTaskStatus(status: string) {
+  return (
+    status === "queued" ||
+    status === "running" ||
+    status === "cancel_requested"
+  );
+}
+
+function isFinalImageTaskStatus(status: string) {
+  return (
+    status === "succeeded" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "expired"
+  );
+}
+
+function selectPreferredTaskForTurn(
+  turn: ImageConversationTurn,
+  tasks: ImageTaskView[],
+) {
+  if (tasks.length === 0) {
+    return null;
+  }
+  const boundTask = turn.taskId
+    ? tasks.find((candidate) => candidate.id === turn.taskId) ?? null
+    : null;
+  if (boundTask && !isFinalImageTaskStatus(boundTask.status)) {
+    return boundTask;
+  }
+  const latestActiveTask =
+    tasks
+      .filter((candidate) => isActiveImageTaskStatus(candidate.status))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ??
+    null;
+  if (latestActiveTask) {
+    return latestActiveTask;
+  }
+  const latestNonCancelledTask =
+    [...tasks]
+      .filter((candidate) => candidate.status !== "cancelled")
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ??
+    null;
+  if (latestNonCancelledTask) {
+    return latestNonCancelledTask;
+  }
+  if (boundTask) {
+    return boundTask;
+  }
+  return tasks[tasks.length - 1] ?? null;
+}
+
+function deriveTurnStatusFromImages(
+  images: StoredImage[],
+  taskStatus: string,
+): ImageConversationStatus {
+  if (images.some((image) => image.status === "loading")) {
+    return taskStatus === "queued" ? "queued" : "running";
+  }
+  if (images.some((image) => image.status === "error")) {
+    return "error";
+  }
+  if (images.length > 0 && images.every((image) => image.status === "success")) {
+    return "success";
+  }
+  return mapTaskStatusToTurnStatus(taskStatus);
+}
+
+function applyTaskViewToConversation(
+  conversation: ImageConversation,
+  tasksByTurnKey: Map<string, ImageTaskView[]>,
+) {
+  const turns = (conversation.turns ?? []).map((turn) => {
+    const tasks = tasksByTurnKey.get(`${conversation.id}:${turn.id}`) ?? [];
+    const task = selectPreferredTaskForTurn(turn, tasks);
+    if (!task) {
+      return turn;
+    }
+    const mappedTaskImages =
+      task.images.length > 0 ? mapTaskImagesToStoredImages(task.images) : [];
+    const mergedImages =
+      typeof task.retryImageIndex === "number"
+        ? mergeRetryImageResult(turn.images, mappedTaskImages, task.retryImageIndex)
+        : mappedTaskImages.length > 0
+          ? mappedTaskImages
+          : turn.images;
+    const mergedStatus = deriveTurnStatusFromImages(mergedImages, task.status);
+    const mergedError =
+      mergedStatus === "error"
+        ? task.error || turn.error
+        : undefined;
+    return {
+      ...turn,
+      taskId: task.id,
+      status: mergedStatus,
+      queuePosition: task.queuePosition,
+      waitingReason: task.waitingReason,
+      waitingDetail: task.blockers?.[0]?.detail,
+      startedAt: task.startedAt,
+      finishedAt: task.finishedAt,
+      cancelRequested: task.cancelRequested,
+      error: mergedError,
+      images: mergedImages,
+    };
+  });
+  return normalizeConversation({
+    ...conversation,
+    turns,
+  });
+}
+
+function buildProcessingStatus(
+  mode: ImageMode,
+  elapsedSeconds: number,
+  count: number,
+  variant: ActiveRequestState["variant"],
+) {
+  if (mode === "generate") {
+    if (elapsedSeconds < 4) {
+      return {
+        title: "正在提交生成请求",
+        detail: `已进入图像生成队列，本次目标 ${count} 张`,
+      };
+    }
+    if (elapsedSeconds < 12) {
+      return {
+        title: "正在排队创建画面",
+        detail: "模型正在准备构图与风格细节",
+      };
+    }
+    return {
+      title: "模型正在生成图片",
+      detail: "通常需要 1 到 5 分钟，请保持页面开启",
+    };
+  }
+
+  if (mode === "edit") {
+    if (elapsedSeconds < 4) {
+      return {
+        title:
+          variant === "selection-edit"
+            ? "正在提交选区编辑"
+            : "正在提交编辑请求",
+        detail: "请求已发送，正在准备处理素材",
+      };
+    }
+    if (elapsedSeconds < 12) {
+      return {
+        title:
+          variant === "selection-edit"
+            ? "正在上传源图和选区"
+            : "正在上传编辑素材",
+        detail: "素材上传完成后会立即进入改图阶段",
+      };
+    }
+    return {
+      title:
+        variant === "selection-edit"
+          ? "模型正在按选区修改图片"
+          : "模型正在编辑图片",
+      detail: "通常需要 1 到 5 分钟，请保持页面开启",
+    };
+  }
+
   return {
-    id: conversationId,
-    title: draftTurn.title,
-    mode: draftTurn.mode,
-    prompt: draftTurn.prompt,
-    model: draftTurn.model,
-    count: draftTurn.count,
-    size: draftTurn.size,
-    quality: draftTurn.quality,
-    scale: draftTurn.scale,
-    sourceImages: draftTurn.sourceImages,
-    images: draftTurn.images,
-    createdAt: draftTurn.createdAt,
-    status: draftTurn.status,
-    error: draftTurn.error,
-    turns: [draftTurn],
+    title: "模型正在编辑图片",
+    detail: "通常需要 1 到 5 分钟，请保持页面开启",
   };
 }
 
-function mergeResultImages(
-  turnId: string,
-  items: Array<{
-    url?: string;
-    b64_json?: string;
-    revised_prompt?: string;
-    file_id?: string;
-    gen_id?: string;
-    conversation_id?: string;
-    parent_message_id?: string;
-    source_account_id?: string;
-  }>,
-  expected: number,
-) {
-  const results: StoredImage[] = items.map((item, index) =>
-    item.b64_json || item.url
-      ? {
-          id: `${turnId}-${index + 1}`,
-          status: "success",
-          b64_json: item.b64_json,
-          url: item.url,
-          revised_prompt: item.revised_prompt,
-          file_id: item.file_id,
-          gen_id: item.gen_id,
-          conversation_id: item.conversation_id,
-          parent_message_id: item.parent_message_id,
-          source_account_id: item.source_account_id,
-        }
-      : {
-          id: `${turnId}-${index + 1}`,
-          status: "error",
-          error: "接口没有返回图片数据",
-        },
-  );
-
-  while (results.length < expected) {
-    results.push({
-      id: `${turnId}-${results.length + 1}`,
-      status: "error",
-      error: "接口返回的图片数量不足",
-    });
-  }
-
-  return results;
-}
-
-function countFailures(images: StoredImage[]) {
-  return images.filter((image) => image.status === "error").length;
-}
-
-function buildImageDataUrl(image: StoredImage) {
-  if (image.url) {
-    return image.url;
-  }
-  if (!image.b64_json) {
-    return "";
-  }
-  return `data:image/png;base64,${image.b64_json}`;
-}
-
-function buildSourceImageUrl(source: StoredSourceImage) {
-  return String(source.dataUrl || source.url || "").trim();
-}
-
-function buildConversationPreviewSource(conversation: ImageConversation) {
-  const latestSuccessfulImage = conversation.images.find(
-    (image) => image.status === "success" && (image.b64_json || image.url),
-  );
-  if (latestSuccessfulImage) {
-    return buildImageDataUrl(latestSuccessfulImage);
-  }
-  const firstSourceImage = conversation.sourceImages?.find((item) => item.role === "image");
-  return firstSourceImage ? buildSourceImageUrl(firstSourceImage) : "";
-}
-
-function buildConversationSourceLabel(source: StoredSourceImage) {
-  return source.role === "mask" ? "选区 / 遮罩" : "源图";
-}
-
-async function fileToDataUrl(file: File) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(new Error(`读取 ${file.name} 失败`));
-    reader.readAsDataURL(file);
-  });
-}
-
-async function dataUrlToFile(dataUrl: string, fileName: string) {
-  const response = await fetch(dataUrl);
-  const blob = await response.blob();
-  return new File([blob], fileName, { type: blob.type || "image/png" });
-}
-
-function formatTurnSizeLabel(size?: string) {
-  return String(size || "")
-    .trim()
-    .replace("x", " X ");
-}
-
-function buildDownloadName(createdAt: string, turnId: string, index: number) {
-  const date = new Date(createdAt);
-  const safeIndex = String(index + 1).padStart(2, "0");
-  if (Number.isNaN(date.getTime())) {
-    return `cheilins-studio-${turnId.slice(0, 8)}-${safeIndex}.png`;
-  }
-
-  const yyyy = String(date.getFullYear());
-  const mm = String(date.getMonth() + 1).padStart(2, "0");
-  const dd = String(date.getDate()).padStart(2, "0");
-  const hh = String(date.getHours()).padStart(2, "0");
-  const min = String(date.getMinutes()).padStart(2, "0");
-  const sec = String(date.getSeconds()).padStart(2, "0");
-  return `cheilins-studio-${yyyy}${mm}${dd}-${hh}${min}${sec}-${safeIndex}.png`;
-}
-
-async function copyPromptToClipboard(prompt: string) {
-  const text = prompt.trim();
-  if (!text) {
-    toast.warning("没有可复制的提示词");
-    return;
-  }
-
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const input = document.createElement("textarea");
-      input.value = text;
-      input.setAttribute("readonly", "");
-      input.style.position = "fixed";
-      input.style.left = "-9999px";
-      document.body.appendChild(input);
-      input.select();
-      document.execCommand("copy");
-      document.body.removeChild(input);
-    }
-    toast.success("提示词已复制");
-  } catch {
-    toast.error("复制失败");
-  }
-}
-
-async function normalizeConversationHistory(items: ImageConversation[]) {
-  const normalized = items.map((item) => {
-    let changed = false;
-    const conversation = normalizeConversation(item);
-    const turns = (conversation.turns || []).map((turn) => {
-      if (turn.status !== "generating" || isImageTaskActive(conversation.id, turn.id)) {
-        return turn;
-      }
-
-      changed = true;
-      const errorMessage = turn.images.some((image) => image.status === "success")
-        ? turn.error || "任务已中断"
-        : "页面已刷新，任务已中断";
-
-      return {
-        ...turn,
-        status: "error" as const,
-        error: errorMessage,
-        images: turn.images.map((image) =>
-          image.status === "loading"
-            ? {
-                ...image,
-                status: "error" as const,
-                error: "页面已刷新，任务已中断",
-              }
-            : image,
-        ),
-      };
-    });
-
-    return {
-      changed,
-      conversation: normalizeConversation({
-        ...conversation,
-        turns,
-      }),
-    };
-  });
-
-  await Promise.all(
-    normalized
-      .filter((item) => item.changed)
-      .map((item) => saveImageConversation(item.conversation)),
-  );
-
-  return normalized.map((item) => item.conversation);
-}
-
-const HistorySidebar = memo(function HistorySidebar({
-  conversations,
-  selectedConversationId,
-  isLoadingHistory,
-  hasActiveTasks,
-  activeConversationIds,
-  onCreateDraft,
-  onClearHistory,
-  onFocusConversation,
-  onDeleteConversation,
-}: HistorySidebarProps) {
-  return (
-    <aside className="order-2 max-h-[36vh] overflow-hidden rounded-[28px] border border-stone-200 bg-[#f8f8f7] shadow-[0_8px_30px_rgba(15,23,42,0.04)] lg:order-none lg:max-h-none lg:min-h-0">
-      <div className="flex h-full min-h-0 flex-col">
-        <div className="border-b border-stone-200/80 px-4 py-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-lg font-semibold tracking-tight text-stone-900">
-                历史记录
-              </h2>
-            </div>
-            <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-stone-500 shadow-sm">
-              {conversations.length}
-            </span>
-          </div>
-          <div className="mt-4 flex items-center gap-2">
-            <Button className="h-11 flex-1 rounded-2xl bg-stone-950 text-white hover:bg-stone-800" onClick={onCreateDraft}>
-              <Wand2 className="size-4" />
-              新建对话
-            </Button>
-            <Button
-              variant="outline"
-              className="h-11 rounded-2xl border-stone-200 bg-white px-3 text-stone-600 hover:bg-stone-50"
-              onClick={() => void onClearHistory()}
-              disabled={conversations.length === 0 || hasActiveTasks}
-              title={hasActiveTasks ? "有任务运行中时不能清空历史" : "清空历史记录"}
-            >
-              <Trash2 className="size-4" />
-            </Button>
-          </div>
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
-          {isLoadingHistory ? (
-            <div className="flex items-center gap-2 rounded-2xl px-3 py-3 text-sm text-stone-500">
-              <LoaderCircle className="size-4 animate-spin" />
-              正在读取会话记录
-            </div>
-          ) : conversations.length === 0 ? (
-            <div className="px-3 py-4 text-sm leading-6 text-stone-500">
-              还没有历史记录。创建第一条图片任务后，会在这里保留缩略图和提示词摘要。
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {conversations.map((conversation) => {
-                const active = conversation.id === selectedConversationId;
-                const isDeletingDisabled = activeConversationIds.has(conversation.id);
-                const previewSrc = buildConversationPreviewSource(conversation);
-                return (
-                  <div
-                    key={conversation.id}
-                    className={cn(
-                      "group rounded-[22px] border p-2 transition",
-                      active
-                        ? "border-stone-200 bg-white shadow-sm"
-                        : "border-transparent bg-transparent hover:border-stone-200/80 hover:bg-white/70",
-                    )}
-                  >
-                    <div className="flex items-center gap-3">
-                      <button
-                        type="button"
-                        onClick={() => onFocusConversation(conversation.id)}
-                        className="flex min-w-0 flex-1 items-center gap-3 text-left"
-                      >
-                        <div className="flex size-14 shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-stone-100">
-                          {previewSrc ? (
-                            <Image src={previewSrc} alt={conversation.title} width={56} height={56} unoptimized className="h-full w-full object-cover" />
-                          ) : (
-                            <History className="size-4 text-stone-400" />
-                          )}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            <span className="rounded-full bg-stone-100 px-2 py-0.5 text-[11px] font-medium text-stone-500">
-                              {modeLabelMap[conversation.mode]}
-                            </span>
-                            <span className="truncate text-xs text-stone-400">
-                              {formatConversationTime(conversation.createdAt)}
-                            </span>
-                          </div>
-                          <div className="mt-2 truncate text-sm font-medium text-stone-800">
-                            {conversation.title}
-                          </div>
-                          <div className="mt-1 line-clamp-2 text-xs leading-5 text-stone-500">
-                            {conversation.prompt || "无额外提示词"}
-                          </div>
-                        </div>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void onDeleteConversation(conversation.id)}
-                        disabled={isDeletingDisabled}
-                        title={isDeletingDisabled ? "当前会话仍在处理中，暂时不能删除" : "删除会话"}
-                        className="inline-flex size-8 shrink-0 items-center justify-center rounded-xl text-stone-400 opacity-100 transition hover:bg-stone-100 hover:text-rose-500 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-stone-400 lg:opacity-0 lg:group-hover:opacity-100 lg:disabled:opacity-40"
-                        aria-label="删除会话"
-                      >
-                        <Trash2 className="size-4" />
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      </div>
-    </aside>
-  );
-});
-
-function WorkspaceHeader({
-  historyCollapsed,
-  selectedConversationTitle,
-  onToggleHistory,
-}: WorkspaceHeaderProps) {
-  return (
-    <div className="hidden border-b border-stone-200/80 px-5 py-4 sm:px-6 lg:block">
-      <div className="min-w-0">
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            className="h-10 rounded-full border-stone-200 bg-white px-4 text-stone-700 shadow-none"
-            onClick={onToggleHistory}
-          >
-            {historyCollapsed ? <PanelLeftOpen className="size-4" /> : <PanelLeftClose className="size-4" />}
-            {historyCollapsed ? "展开历史" : "收起历史"}
-          </Button>
-          <h1 className="text-xl font-semibold tracking-tight text-stone-950 sm:text-[22px]">
-            图片工作台
-          </h1>
-          {selectedConversationTitle ? (
-            <span className="truncate rounded-full bg-stone-100 px-3 py-1 text-xs font-medium text-stone-600">
-              {selectedConversationTitle}
-            </span>
-          ) : null}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function EmptyState({
-  onApplyPromptExample,
-}: {
-  onApplyPromptExample: (example: (typeof inspirationExamples)[number]) => void;
-}) {
-  return (
-    <div className="mx-auto flex max-w-[1120px] flex-col gap-8 px-4 py-8 sm:px-6">
-      <div className="max-w-[760px]">
-        <div className="inline-flex size-14 items-center justify-center rounded-[20px] bg-stone-950 text-white shadow-sm">
-          <Sparkles className="size-5" />
-        </div>
-        <h1 className="mt-6 text-3xl font-semibold tracking-tight text-stone-950 lg:text-5xl">
-          从一个提示词，开始完整的图像工作流。
-        </h1>
-      </div>
-
-      <div className="hide-scrollbar flex gap-3 overflow-x-auto pb-1 md:grid md:grid-cols-2 md:overflow-visible xl:grid-cols-4">
-        {inspirationExamples.map((example) => (
-          <button
-            key={example.id}
-            type="button"
-            onClick={() => onApplyPromptExample(example)}
-            className="w-[220px] shrink-0 overflow-hidden rounded-[22px] border border-stone-200 bg-white text-left transition hover:-translate-y-0.5 hover:border-stone-300 hover:shadow-sm md:w-auto"
-          >
-            <div className={cn("h-[4.5rem] bg-gradient-to-br md:h-20", example.tone)} />
-            <div className="space-y-2 px-4 py-3.5">
-              <div className="flex items-center gap-2 text-[11px] text-stone-500">
-                <span className="rounded-full bg-stone-100 px-2 py-0.5 font-medium">Prompt</span>
-              </div>
-              <div className="text-sm font-semibold tracking-tight text-stone-900">
-                {example.title}
-              </div>
-              <div className="line-clamp-2 text-sm leading-6 text-stone-600">
-                {example.prompt}
-              </div>
-              <div className="border-t border-stone-100 pt-2 text-xs leading-5 text-stone-500">
-                {example.hint}
-              </div>
-            </div>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-const ConversationTurns = memo(function ConversationTurns({
-  conversationId,
-  turns,
-  activeRequest,
-  isSubmitting,
-  processingStatus,
-  waitingDots,
-  submitElapsedSeconds,
-  publishedImageKeys,
-  publishingImageKey,
-  onSeedFromResult,
-  onPublishImage,
-  onRetryTurn,
-}: ConversationTurnsProps) {
-  return (
-    <div className="mx-auto flex w-full max-w-[1120px] flex-col gap-8 px-4 pt-0 pb-8 sm:px-6 sm:py-8">
-      {turns.map((turn) => {
-        const turnProcessing = Boolean(
-          isSubmitting &&
-            activeRequest &&
-            activeRequest.conversationId === conversationId &&
-            activeRequest.turnId === turn.id,
-        );
-
-        return (
-          <div key={turn.id} className="space-y-4">
-            <div className="flex justify-end">
-              <div className="flex w-full max-w-[78%] flex-col items-end gap-4">
-                {turn.sourceImages && turn.sourceImages.length > 0 ? (
-                  <div className="flex flex-wrap justify-end gap-2.5">
-                    {turn.sourceImages.map((source) => (
-                      <div key={source.id} className="w-[136px] overflow-hidden rounded-[20px] border border-stone-200 bg-white shadow-sm">
-                        <div className="border-b border-stone-100 px-3 py-2 text-left text-[11px] font-medium text-stone-500">
-                          {buildConversationSourceLabel(source)}
-                        </div>
-                        <Zoom>
-                          <Image
-                            src={buildSourceImageUrl(source)}
-                            alt={source.name}
-                            width={220}
-                            height={160}
-                            unoptimized
-                            className="block h-24 w-full cursor-zoom-in bg-stone-50 object-contain"
-                          />
-                        </Zoom>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-                <div className="group flex max-w-full flex-col items-start gap-1.5">
-                  <div className="min-w-0 whitespace-pre-wrap break-words rounded-[28px] bg-[#f2f2f1] px-5 py-4 text-[15px] leading-7 text-stone-800 shadow-[inset_0_1px_0_rgba(255,255,255,0.75)]">
-                    {turn.prompt || "无额外提示词"}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => void copyPromptToClipboard(turn.prompt || "")}
-                    className="inline-flex h-7 shrink-0 items-center gap-1 rounded-full border border-stone-200 bg-white px-2.5 text-xs font-medium text-stone-500 opacity-0 shadow-sm transition hover:bg-stone-100 hover:text-stone-900 focus-visible:opacity-100 focus-visible:outline-none group-hover:opacity-100"
-                    title="复制提示词"
-                    aria-label="复制提示词"
-                  >
-                    <Copy className="size-3.5" />
-                    复制
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="space-y-4">
-              <div className="flex items-center gap-3 px-1">
-                <span className="flex size-9 items-center justify-center rounded-2xl bg-stone-950 text-white">
-                  <Sparkles className="size-4" />
-                </span>
-                <div>
-                  <div className="text-sm font-semibold tracking-tight text-stone-900">
-                    Cheilins Studio
-                  </div>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2 px-1 text-xs text-stone-500">
-                <span className="rounded-full bg-stone-100 px-3 py-1.5">{modeLabelMap[turn.mode]}</span>
-                <span className="rounded-full bg-stone-100 px-3 py-1.5">{turn.model}</span>
-                <span className="rounded-full bg-stone-100 px-3 py-1.5">{turn.count} 张</span>
-                {turn.size ? <span className="rounded-full bg-stone-100 px-3 py-1.5">{formatTurnSizeLabel(turn.size)}</span> : null}
-                {turn.quality ? <span className="rounded-full bg-stone-100 px-3 py-1.5">Quality {turn.quality}</span> : null}
-                {turn.scale ? <span className="rounded-full bg-stone-100 px-3 py-1.5">{turn.scale}</span> : null}
-                <span className="rounded-full bg-stone-100 px-3 py-1.5">
-                  <Clock3 className="mr-1 inline size-3.5" />
-                  {formatConversationTime(turn.createdAt)}
-                </span>
-              </div>
-
-              {turn.images.length > 0 ? (
-                <div className={cn("grid gap-4", turn.images.length === 1 ? "grid-cols-1" : "grid-cols-1 lg:grid-cols-2")}>
-                  {turn.images.map((image, index) => {
-                    const imageDataUrl = buildImageDataUrl(image);
-                    const downloadName = buildDownloadName(turn.createdAt, turn.id, index);
-                    const publishRecordKey = buildGalleryPublishRecordKey(conversationId, turn.id, image.id);
-                    const published = publishedImageKeys.has(publishRecordKey);
-                    const publishing = publishingImageKey === publishRecordKey;
-                    return (
-                      <div
-                        key={image.id}
-                        className={cn(
-                          "overflow-hidden rounded-[22px] border border-stone-200 bg-white shadow-sm",
-                          turn.images.length === 1 && "w-fit max-w-full justify-self-start",
-                        )}
-                      >
-                        {image.status === "success" && imageDataUrl ? (
-                          <div>
-                            <Zoom>
-                              <Image
-                                src={imageDataUrl}
-                                alt={`Generated result ${index + 1}`}
-                                width={1024}
-                                height={1024}
-                                unoptimized
-                                className="block h-auto max-h-[360px] w-auto max-w-full cursor-zoom-in"
-                              />
-                            </Zoom>
-                            <div className="flex flex-wrap items-center gap-2 border-t border-stone-100 px-4 py-3">
-                              <button
-                                type="button"
-                                className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-stone-600 transition hover:bg-stone-100 hover:text-stone-900"
-                                onClick={() => onSeedFromResult(conversationId, image, "edit")}
-                                title="引用到编辑"
-                                aria-label="引用到编辑"
-                              >
-                                <Copy className="size-4" />
-                              </button>
-                              <button
-                                type="button"
-                                className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-stone-600 transition hover:bg-stone-100 hover:text-stone-900"
-                                onClick={() => onSeedFromResult(conversationId, image, "upscale")}
-                                title="引用到放大"
-                                aria-label="引用到放大"
-                              >
-                                <Sparkles className="size-4" />
-                              </button>
-                              <a
-                                href={imageDataUrl}
-                                download={downloadName}
-                                className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-stone-600 transition hover:bg-stone-100 hover:text-stone-900"
-                                title="下载"
-                                aria-label="下载"
-                              >
-                                <Download className="size-4" />
-                              </a>
-                              <button
-                                type="button"
-                                className={cn(
-                                  "inline-flex size-9 items-center justify-center rounded-full border transition",
-                                  published
-                                    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                                    : "border-stone-200 bg-white text-stone-600 hover:bg-stone-100 hover:text-stone-900",
-                                )}
-                                onClick={() => void onPublishImage(conversationId, turn, image)}
-                                title={published ? "已发布到作品广场" : publishing ? "正在发布" : "发布到作品广场"}
-                                aria-label={published ? "已发布到作品广场" : "发布到作品广场"}
-                                disabled={published || publishing}
-                              >
-                                {publishing ? <LoaderCircle className="size-4 animate-spin" /> : <Upload className="size-4" />}
-                              </button>
-                            </div>
-                          </div>
-                        ) : image.status === "error" ? (
-                          <div className="flex min-h-[320px] flex-col">
-                            <div className="flex flex-1 items-center justify-center whitespace-pre-line bg-rose-50 px-6 py-8 text-center text-sm leading-7 text-rose-600">
-                              {image.error || "处理失败"}
-                            </div>
-                            <div className="flex flex-wrap items-center gap-2 border-t border-stone-100 px-4 py-3">
-                              <button
-                                type="button"
-                                className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-rose-600 transition hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
-                                onClick={() => void onRetryTurn(conversationId, turn)}
-                                disabled={isSubmitting}
-                                title={isSubmitting ? "处理中" : "重试"}
-                                aria-label="重试"
-                              >
-                                <RotateCcw className="size-4" />
-                              </button>
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="flex min-h-[320px] flex-col items-center justify-center gap-3 bg-stone-50 px-6 py-8 text-center text-stone-500">
-                            <div className="rounded-full bg-white p-3 shadow-sm">
-                              <LoaderCircle className="size-5 animate-spin" />
-                            </div>
-                            <p className="text-sm font-medium text-stone-700">
-                              {turnProcessing && processingStatus ? `${processingStatus.title}${waitingDots}` : "正在处理图片..."}
-                            </p>
-                            <p className="text-xs leading-6 text-stone-400">
-                              {turnProcessing && processingStatus
-                                ? `${processingStatus.detail} · 已等待 ${formatProcessingDuration(submitElapsedSeconds)}`
-                                : "图片处理通常需要几十秒，请稍候"}
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : null}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-});
-
-function PromptComposer({
-  mode,
-  imageCount,
-  imageSize,
-  imageQuality,
-  upscaleScale,
-  availableQuota,
-  sourceImages,
-  imagePrompt,
-  hasGenerateReferences,
-  isSubmitting,
-  textareaRef,
-  uploadInputRef,
-  maskInputRef,
-  onModeChange,
-  onImageCountChange,
-  onImageSizeChange,
-  onImageQualityChange,
-  onUpscaleScaleChange,
-  onPromptChange,
-  onPromptPaste,
-  onRemoveSourceImage,
-  onAppendFiles,
-  onMobileCollapsedChange,
-  onSubmit,
-}: PromptComposerProps) {
-  const hasComposerContent = imagePrompt.trim().length > 0 || sourceImages.length > 0;
-  const previousHasComposerContentRef = useRef(hasComposerContent);
-  const [isMobileComposerExpanded, setIsMobileComposerExpanded] = useState(hasComposerContent);
-  const isMobileComposerCollapsed = !isMobileComposerExpanded;
-  const showMobileExpandedSections = !isMobileComposerCollapsed;
-
-  useEffect(() => {
-    if (hasComposerContent && !previousHasComposerContentRef.current) {
-      setIsMobileComposerExpanded(true);
-    } else if (!hasComposerContent && previousHasComposerContentRef.current) {
-      setIsMobileComposerExpanded(false);
-    }
-    previousHasComposerContentRef.current = hasComposerContent;
-  }, [hasComposerContent]);
-
-  useEffect(() => {
-    onMobileCollapsedChange(isMobileComposerCollapsed);
-  }, [isMobileComposerCollapsed, onMobileCollapsedChange]);
-
-  return (
-    <div
-      className={cn(
-        "fixed inset-x-0 bottom-0 z-30 px-3 backdrop-blur supports-[padding:max(0px)]:pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-4 lg:static lg:inset-auto lg:bottom-auto lg:z-20 lg:rounded-none lg:border-x-0 lg:border-b-0 lg:border-t lg:bg-white lg:px-5 lg:shadow-none",
-        isMobileComposerCollapsed
-          ? "border-transparent bg-white/96 shadow-none"
-          : "rounded-[26px] border border-stone-200 bg-white/96 shadow-[0_18px_50px_-24px_rgba(15,23,42,0.35)]",
-        isMobileComposerCollapsed ? "py-1.5 sm:py-2" : "py-2 sm:py-3",
-        "lg:border-stone-200 lg:bg-white lg:py-4 lg:shadow-none",
-      )}
-    >
-      <div className="mx-auto flex max-w-[1120px] flex-col gap-3">
-        <div
-          className={cn(
-            "flex-col gap-2 xl:flex-row xl:items-center xl:justify-between",
-            showMobileExpandedSections ? "flex" : "hidden lg:flex",
-          )}
-        >
-          <div className="flex items-center gap-2">
-            <div className="hide-scrollbar min-w-0 flex-1 -mx-1 overflow-x-auto px-1 xl:mx-0 xl:px-0">
-              <div className="inline-flex min-w-max rounded-full bg-stone-100 p-1">
-                {modeOptions.map((item) => (
-                  <button
-                    key={item.value}
-                    type="button"
-                    onClick={() => onModeChange(item.value)}
-                    className={cn(
-                      "rounded-full px-3 py-1.5 text-[13px] font-medium transition sm:px-4 sm:py-2 sm:text-sm",
-                      mode === item.value
-                        ? "bg-stone-950 text-white shadow-sm"
-                        : "text-stone-600 hover:bg-stone-200 hover:text-stone-900",
-                    )}
-                  >
-                    {item.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="hide-scrollbar -mx-1 flex items-center gap-1.5 overflow-x-auto px-1 pb-1 sm:mx-0 sm:flex-wrap sm:gap-2 sm:overflow-visible sm:px-0 sm:pb-0">
-            {mode === "generate" && !hasGenerateReferences ? (
-              <>
-                <Select value={imageSize} onValueChange={onImageSizeChange}>
-                  <SelectTrigger className="h-9 w-[128px] shrink-0 rounded-full border-stone-200 bg-white text-[13px] font-medium text-stone-700 shadow-none focus-visible:ring-0 sm:h-10 sm:w-[150px] sm:text-sm">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {sizeOptions.map((item) => (
-                      <SelectItem key={item.value} value={item.value}>
-                        {item.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-
-                <Select value={imageQuality} onValueChange={(value) => onImageQualityChange(value as ImageQuality)}>
-                  <SelectTrigger className="h-9 w-[130px] shrink-0 rounded-full border-stone-200 bg-white text-[13px] font-medium text-stone-700 shadow-none focus-visible:ring-0 sm:h-10 sm:w-[150px] sm:text-sm">
-                    <SelectValue>{`质量 ${qualityOptions.find((item) => item.value === imageQuality)?.label || imageQuality}`}</SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    {qualityOptions.map((item) => (
-                      <SelectItem key={item.value} value={item.value}>
-                        <span title={item.description}>{item.label}</span>
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-
-                <div className="flex shrink-0 items-center gap-1 rounded-full border border-stone-200 bg-white px-2 py-0.5 sm:gap-1.5 sm:px-2.5 sm:py-1">
-                  <span className="text-[13px] font-medium text-stone-700 sm:text-sm">张数</span>
-                  <Input
-                    type="number"
-                    min="1"
-                    max="4"
-                    step="1"
-                    value={imageCount}
-                    onChange={(event) => onImageCountChange(event.target.value)}
-                    className="h-7 w-[36px] border-0 bg-transparent px-0 text-center text-[13px] font-medium text-stone-700 shadow-none focus-visible:ring-0 sm:h-8 sm:w-[42px] sm:text-sm"
-                  />
-                </div>
-              </>
-            ) : null}
-
-            {mode === "upscale" ? (
-              <Select value={upscaleScale} onValueChange={onUpscaleScaleChange}>
-                <SelectTrigger className="h-9 w-[110px] shrink-0 rounded-full border-stone-200 bg-white text-[13px] font-medium text-stone-700 shadow-none focus-visible:ring-0 sm:h-10 sm:w-[124px] sm:text-sm">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {upscaleOptions.map((item) => (
-                    <SelectItem key={item} value={item}>
-                      {item}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            ) : null}
-
-            <span className="shrink-0 rounded-full bg-stone-100 px-2.5 py-1.5 text-[11px] font-medium text-stone-600 sm:px-3 sm:py-2 sm:text-xs">
-              剩余额度 {availableQuota}
-            </span>
-          </div>
-        </div>
-
-        <div
-          className="overflow-hidden rounded-[24px] border border-stone-200 bg-[#fafaf9] shadow-[inset_0_1px_0_rgba(255,255,255,0.9)] sm:rounded-[28px]"
-          onClick={() => {
-            setIsMobileComposerExpanded(true);
-            textareaRef.current?.focus();
-          }}
-        >
-          {sourceImages.length > 0 ? (
-            <div
-              className={cn(
-                "hide-scrollbar gap-2 overflow-x-auto border-b border-stone-200 px-3 py-2 sm:gap-3 sm:px-4 sm:py-3",
-                showMobileExpandedSections ? "flex" : "hidden lg:flex",
-              )}
-            >
-              {sourceImages.map((item) => (
-                <div key={item.id} className="w-[104px] shrink-0 overflow-hidden rounded-[16px] border border-stone-200 bg-white sm:w-[126px] sm:rounded-[18px]">
-                  <div className="flex items-center justify-between border-b border-stone-100 px-3 py-2 text-[11px] font-medium text-stone-500">
-                    <span>{item.role === "mask" ? "遮罩" : "源图"}</span>
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onRemoveSourceImage(item.id);
-                      }}
-                      className="rounded-md p-1 text-stone-400 transition hover:bg-stone-100 hover:text-rose-500"
-                    >
-                      <Trash2 className="size-3.5" />
-                    </button>
-                  </div>
-                  <Zoom>
-                    <Image src={buildSourceImageUrl(item)} alt={item.name} width={160} height={110} unoptimized className="block h-16 w-full cursor-zoom-in bg-stone-50 object-contain sm:h-20" />
-                  </Zoom>
-                </div>
-              ))}
-            </div>
-          ) : null}
-
-          <div className="relative px-3 pb-1.5 pt-2.5 sm:px-4 sm:pb-2 sm:pt-3">
-            <Textarea
-              ref={textareaRef}
-              value={imagePrompt}
-              onChange={(event) => onPromptChange(event.target.value)}
-              placeholder={mode === "generate" ? "描述你想生成的画面，也可以先上传参考图" : mode === "edit" ? "描述你想如何修改当前图片" : "可选：描述你想增强的方向"}
-              onPaste={onPromptPaste}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  if (!isSubmitting) {
-                    void onSubmit();
-                  }
-                }
-              }}
-              className={cn(
-                "resize-none border-0 bg-transparent !px-1 !pb-1 text-[14px] text-stone-900 shadow-none placeholder:text-stone-400 focus-visible:ring-0 sm:min-h-[92px] sm:max-h-[480px] sm:text-[15px] sm:leading-7",
-                isMobileComposerCollapsed ? "min-h-[24px] max-h-[24px] overflow-hidden !pt-0.5 !pb-0.5 pr-9 leading-6" : "min-h-[72px] max-h-[180px] overflow-y-auto !pt-1 pr-10 leading-6",
-              )}
-            />
-          </div>
-          <div className={cn("px-3 pb-2 pt-1.5 sm:px-4 sm:pb-4 sm:pt-2", showMobileExpandedSections ? "block" : "hidden lg:block")}>
-            <div className="flex items-end justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-7 rounded-full border-stone-200 bg-white px-2 text-[11px] font-medium text-stone-700 shadow-none sm:h-8 sm:px-2.5 sm:text-xs"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    uploadInputRef.current?.click();
-                  }}
-                >
-                  <ImagePlus className="size-3.5" />
-                  {mode === "generate" ? "上传参考图" : mode === "edit" ? "上传源图" : "上传图片"}
-                </Button>
-
-                {mode === "edit" ? (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-7 rounded-full border-stone-200 bg-white px-2 text-[11px] font-medium text-stone-700 shadow-none sm:h-8 sm:px-2.5 sm:text-xs"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      maskInputRef.current?.click();
-                    }}
-                  >
-                    <Upload className="size-3.5" />
-                    遮罩
-                  </Button>
-                ) : null}
-              </div>
-
-              <button
-                type="button"
-                onClick={() => void onSubmit()}
-                disabled={isSubmitting}
-                className="inline-flex size-8 shrink-0 items-center justify-center rounded-full bg-stone-950 text-white transition hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300 sm:size-9"
-                aria-label="提交图片任务"
-              >
-                {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : <ArrowUp className="size-4" />}
-              </button>
-            </div>
-          </div>
-
-          <input
-            ref={uploadInputRef}
-            type="file"
-            accept="image/*"
-            multiple={mode !== "upscale"}
-            className="hidden"
-            onChange={(event) => {
-              void onAppendFiles(event.target.files, "image");
-              event.currentTarget.value = "";
-            }}
-          />
-          <input
-            ref={maskInputRef}
-            type="file"
-            accept="image/*"
-            className="hidden"
-            onChange={(event) => {
-              void onAppendFiles(event.target.files, "mask");
-              event.currentTarget.value = "";
-            }}
-          />
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export default function ImagePage() {
+  const { pathname } = useLocation();
+  const navigate = useNavigate();
+  const didLoadQuotaRef = useRef(false);
   const mountedRef = useRef(true);
-  const didLoadBootstrapRef = useRef(false);
-  const resultsViewportRef = useRef<HTMLDivElement | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const draftSelectionRef = useRef(false);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const maskInputRef = useRef<HTMLInputElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const resultsViewportRef = useRef<HTMLDivElement | null>(null);
+  const isNearBottomRef = useRef(true);
+  const previousSelectedConversationIdRef = useRef<string | null>(null);
+  const previousTurnCountRef = useRef(0);
+  const previousLastTurnKeyRef = useRef("");
 
   const [mode, setMode] = useState<ImageMode>("generate");
   const [imagePrompt, setImagePrompt] = useState("");
   const [imageCount, setImageCount] = useState("1");
-  const [imageSize, setImageSize] = useState(sizeOptions[0].value);
+  const [imageAspectRatio, setImageAspectRatio] =
+    useState<ImageAspectRatio>("1:1");
+  const [imageResolutionTier, setImageResolutionTier] =
+    useState<ImageResolutionTier>("sd");
   const [imageQuality, setImageQuality] = useState<ImageQuality>("high");
-  const [upscaleScale, setUpscaleScale] = useState(upscaleOptions[0]);
-  const [sourceImages, setSourceImages] = useState<StoredSourceImage[]>([]);
-  const [conversations, setConversations] = useState<ImageConversation[]>([]);
-  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
-  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
-  const [availableAccounts, setAvailableAccounts] = useState<Account[]>([]);
-  const [availableQuota, setAvailableQuota] = useState("加载中");
-  const [publishedRecords, setPublishedRecords] = useState<Record<string, { work_id: string; published_at: string; key: string }>>({});
-  const [publishingImageKey, setPublishingImageKey] = useState<string | null>(null);
-  const [workspaceConfig, setWorkspaceConfig] = useState<WorkspaceConfig>({
-    allowDisabledStudioAccounts: false,
-  });
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
-  const [activeConversationIds, setActiveConversationIds] = useState<Set<string>>(() => new Set());
-  const [activeRequest, setActiveRequest] = useState<ActiveRequestState | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submitStartedAt, setSubmitStartedAt] = useState<number | null>(null);
-  const [submitElapsedSeconds, setSubmitElapsedSeconds] = useState(0);
-  const [isMobileComposerCollapsed, setIsMobileComposerCollapsed] = useState(true);
-
-  const parsedCount = useMemo(() => Math.max(1, Math.min(4, Number(imageCount) || 1)), [imageCount]);
-  const selectedConversation = useMemo(
-    () => conversations.find((item) => item.id === selectedConversationId) ?? null,
-    [conversations, selectedConversationId],
+  const [isDesktopLayout, setIsDesktopLayout] = useState(() =>
+    typeof window !== "undefined"
+      ? window.matchMedia("(min-width: 1024px)").matches
+      : false,
   );
+  const [availableQuota, setAvailableQuota] = useState("加载中");
+  const [availableAccounts, setAvailableAccounts] = useState<Account[]>([]);
+  const [allowDisabledStudioAccounts, setAllowDisabledStudioAccounts] =
+    useState(false);
+  const [configuredImageMode, setConfiguredImageMode] = useState<
+    "studio" | "cpa"
+  >("studio");
+  const [configuredFreeImageRoute, setConfiguredFreeImageRoute] =
+    useState("legacy");
+  const [submitElapsedSeconds, setSubmitElapsedSeconds] = useState(0);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [isMobileComposerCollapsed, setIsMobileComposerCollapsed] =
+    useState(true);
+  const [taskItems, setTaskItems] = useState<ImageTaskView[]>([]);
+  const [cancellingTaskIds, setCancellingTaskIds] = useState<string[]>([]);
+  const [taskSnapshot, setTaskSnapshot] = useState<ImageTaskSnapshot>(
+    buildEmptyTaskSnapshot(),
+  );
+  const persistedTaskStatesRef = useRef<Record<string, string>>({});
+  const cancellingTaskIdsRef = useRef(new Set<string>());
+  const quotaSyncedTaskIdsRef = useRef(new Set<string>());
+
+  const activeTasks = useMemo(
+    () =>
+      taskItems.filter((task) =>
+        ["queued", "running", "cancel_requested"].includes(task.status),
+      ),
+    [taskItems],
+  );
+  const activeTaskByTurnKey = useMemo(() => {
+    const next = new Map<string, ImageTaskView>();
+    for (const task of activeTasks) {
+      const key = `${task.conversationId}:${task.turnId}`;
+      const current = next.get(key);
+      if (!current || current.createdAt.localeCompare(task.createdAt) < 0) {
+        next.set(key, task);
+      }
+    }
+    return next;
+  }, [activeTasks]);
+  const activeTaskById = useMemo(() => {
+    const next = new Map<string, ImageTaskView>();
+    for (const task of activeTasks) {
+      next.set(task.id, task);
+    }
+    return next;
+  }, [activeTasks]);
+  const displayTaskSnapshot = useMemo(
+    () => deriveTaskSnapshotFromItems(taskItems, taskSnapshot),
+    [taskItems, taskSnapshot],
+  );
+  const activeConversationIds = useMemo(
+    () => new Set(activeTasks.map((task) => task.conversationId)),
+    [activeTasks],
+  );
+  const preferredActiveConversationId = activeTasks[0]?.conversationId ?? null;
+  const hasActiveTasks = activeTasks.length > 0;
+
+  const {
+    conversations,
+    selectedConversationId,
+    isLoadingHistory,
+    setConversations,
+    setSelectedConversationId,
+    focusConversation,
+    openDraftConversation,
+    refreshHistory,
+    handleCreateDraft,
+    handleDeleteConversation,
+    handleClearHistory,
+  } = useImageHistory({
+    normalizeHistory: normalizeConversationHistory,
+    mountedRef,
+    draftSelectionRef,
+    activeConversationIds,
+    preferredActiveConversationId,
+  });
+  const {
+    sourceImages,
+    setSourceImages,
+    editorTarget,
+    appendFiles,
+    handlePromptPaste,
+    removeSourceImage,
+    seedFromResult,
+    openSelectionEditor,
+    openSourceSelectionEditor,
+    closeSelectionEditor,
+  } = useImageSourceInputs({
+    mode,
+    selectedConversationId,
+    setMode,
+    focusConversation,
+    textareaRef,
+    makeId,
+  });
+  const selectedConversationActiveTaskByTurnId = useMemo(() => {
+    const next = new Map<string, ImageTaskView>();
+    if (!selectedConversationId) {
+      return next;
+    }
+    for (const [key, task] of activeTaskByTurnKey.entries()) {
+      const prefix = `${selectedConversationId}:`;
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      next.set(task.turnId, task);
+    }
+    return next;
+  }, [activeTaskByTurnKey, selectedConversationId]);
+
+  const displayedConversations = useMemo(() => {
+    const tasksByTurnKey = new Map<string, ImageTaskView[]>();
+    taskItems.forEach((task) => {
+      const key = `${task.conversationId}:${task.turnId}`;
+      const current = tasksByTurnKey.get(key) ?? [];
+      current.push(task);
+      current.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+      tasksByTurnKey.set(key, current);
+    });
+    return conversations.map((conversation) =>
+      applyTaskViewToConversation(conversation, tasksByTurnKey),
+    );
+  }, [conversations, taskItems]);
+  const selectedConversation = useMemo(
+    () =>
+      displayedConversations.find((item) => item.id === selectedConversationId) ??
+      null,
+    [displayedConversations, selectedConversationId],
+  );
+  const currentImageView = useMemo<"history" | "workspace">(
+    () => (pathname.endsWith("/workspace") ? "workspace" : "history"),
+    [pathname],
+  );
+  const isStandaloneHistory =
+    !isDesktopLayout && currentImageView === "history";
+  const isStandaloneWorkspace =
+    !isDesktopLayout && currentImageView === "workspace";
   const selectedConversationTurns = useMemo(
     () => selectedConversation?.turns ?? [],
     [selectedConversation],
   );
-  const publishedImageKeys = useMemo(
-    () => new Set(Object.keys(publishedRecords)),
-    [publishedRecords],
+  const selectedConversationLastTurn = useMemo(
+    () =>
+      selectedConversationTurns[selectedConversationTurns.length - 1] ?? null,
+    [selectedConversationTurns],
+  );
+  const selectedConversationLastTurnKey = useMemo(() => {
+    if (!selectedConversationLastTurn) {
+      return "";
+    }
+    const imageKey = selectedConversationLastTurn.images
+      .map(
+        (image) =>
+          `${image.id}:${image.status ?? "loading"}:${image.error ?? ""}`,
+      )
+      .join("|");
+    return `${selectedConversationLastTurn.id}:${selectedConversationLastTurn.status}:${imageKey}`;
+  }, [selectedConversationLastTurn]);
+  const activeRequestTask = useMemo(
+    () => selectConversationActiveTask(activeTasks, selectedConversationId),
+    [activeTasks, selectedConversationId],
+  );
+  const activeRequest = useMemo<ActiveRequestState | null>(
+    () => buildActiveRequestState(activeRequestTask),
+    [activeRequestTask],
+  );
+  const activeRequestStartedAt = useMemo(() => {
+    const raw = activeRequestTask?.startedAt || activeRequestTask?.createdAt;
+    if (!raw) {
+      return null;
+    }
+    const timestamp = new Date(raw).getTime();
+    return Number.isNaN(timestamp) ? null : timestamp;
+  }, [activeRequestTask]);
+  const parsedCount = useMemo(
+    () => Math.max(1, Math.min(8, Number(imageCount) || 1)),
+    [imageCount],
+  );
+  const hasAvailablePaidAccount = useMemo(
+    () =>
+      hasAvailablePaidImageAccount(
+        availableAccounts,
+        allowDisabledStudioAccounts,
+      ),
+    [allowDisabledStudioAccounts, availableAccounts],
+  );
+  const hasLegacyFreeAccountInPool = useMemo(
+    () =>
+      hasUsableFreeLegacyAccount(
+        availableAccounts,
+        allowDisabledStudioAccounts,
+        configuredImageMode,
+        configuredFreeImageRoute,
+      ),
+    [
+      allowDisabledStudioAccounts,
+      availableAccounts,
+      configuredFreeImageRoute,
+      configuredImageMode,
+    ],
+  );
+  const currentResolutionPresets = useMemo(
+    () =>
+      imageAspectRatio === "auto"
+        ? imageAutoResolutionPresets
+        : imageResolutionPresets[imageAspectRatio],
+    [imageAspectRatio],
+  );
+  const selectedResolutionPreset = useMemo(
+    () =>
+      currentResolutionPresets.find(
+        (item) => item.tier === imageResolutionTier,
+      ) ?? currentResolutionPresets[0],
+    [currentResolutionPresets, imageResolutionTier],
+  );
+  const currentRequestRequiresPaidAccount =
+    selectedResolutionPreset?.access === "paid";
+  const imageQualityDisabledReason = currentRequestRequiresPaidAccount
+    ? "当前输出档位会固定走 Paid 账号，质量参数应可正常生效。"
+    : "当前可用号池里仍有 Free legacy 链路账号，标准分辨率请求可能落到该链路，质量参数无法稳定作为正式参数传给上游，暂时置灰。";
+  const isImageQualityEnabled = useMemo(
+    () =>
+      configuredImageMode === "cpa" ||
+      !hasLegacyFreeAccountInPool ||
+      (currentRequestRequiresPaidAccount && hasAvailablePaidAccount),
+    [
+      configuredImageMode,
+      currentRequestRequiresPaidAccount,
+      hasAvailablePaidAccount,
+      hasLegacyFreeAccountInPool,
+    ],
+  );
+  const imageResolutionTierOptions = useMemo(
+    () =>
+      currentResolutionPresets.map((item) => ({
+        label:
+          imageAspectRatio === "auto"
+            ? item.label
+            : `${item.access === "paid" ? "Paid" : "Free"} ${formatResolutionLabel(item.value)}${item.access === "paid" ? `（${item.label.replace("Paid ", "")}）` : ""}`,
+        value: item.tier,
+        disabled: item.access === "paid" && !hasAvailablePaidAccount,
+      })),
+    [currentResolutionPresets, hasAvailablePaidAccount, imageAspectRatio],
+  );
+  const imageResolutionTierLabel = useMemo(
+    () =>
+      imageResolutionTierOptions.find(
+        (item) => item.value === imageResolutionTier && !item.disabled,
+      )?.label ??
+      imageResolutionTierOptions.find((item) => !item.disabled)?.label ??
+      "",
+    [imageResolutionTier, imageResolutionTierOptions],
+  );
+  const imageSize = useMemo(
+    () =>
+      imageAspectRatio === "auto"
+        ? ""
+        :
+      currentResolutionPresets.find(
+        (item) =>
+          item.tier === imageResolutionTier &&
+          (hasAvailablePaidAccount || item.access === "free"),
+      )?.value ??
+      currentResolutionPresets.find(
+        (item) => hasAvailablePaidAccount || item.access === "free",
+      )?.value ??
+      currentResolutionPresets[0].value,
+    [
+      currentResolutionPresets,
+      hasAvailablePaidAccount,
+      imageAspectRatio,
+      imageResolutionTier,
+    ],
+  );
+  const imageResolutionAccess = useMemo<ImageResolutionAccess>(
+    () => selectedResolutionPreset?.access ?? "free",
+    [selectedResolutionPreset],
+  );
+  const imageSizeHint = useMemo(
+    () =>
+      mode === "edit" ? (
+        <>
+          <div>
+            <span className="font-semibold text-stone-800">编辑输出尺寸：</span>
+            编辑模式会尽量按所选比例和分辨率输出结果，但最终尺寸仍可能受源图比例、遮罩范围和上游模型能力影响。
+          </div>
+          <div className="mt-2">
+            <span className="font-semibold text-stone-800">质量说明：</span>
+            输出质量会跟随当前质量档位；如果请求落到 Free legacy
+            链路，质量参数可能不会作为正式参数生效。
+          </div>
+        </>
+      ) : (
+        <>
+          <div>
+            <span className="font-semibold text-stone-800">分辨率限制：</span>
+            Free 账号当前按约 1.57M 像素总量控制；Paid 账号的图片最长边最高支持
+            3840。
+          </div>
+          <div className="mt-2">
+            <span className="font-semibold text-stone-800">账号要求：</span>
+            2K 及以上像素档仅 Paid 账号可用，包括 Team / Plus / Pro。
+          </div>
+          <div className="mt-2">
+            <span className="font-semibold text-stone-800">Auto 模式补充：</span>
+            当比例切到 Auto 时，当前项目不会强制指定比例和分辨率，请直接在提示词里写明横竖版、画幅比例和目标输出尺寸。`Free / Paid` 只决定调度时优先使用哪类图片账号，不会把固定尺寸写进上游请求。
+          </div>
+        </>
+      ),
+    [mode],
   );
   const imageSources = useMemo(
     () => sourceImages.filter((item) => item.role === "image"),
     [sourceImages],
   );
-  const hasGenerateReferences = mode === "generate" && imageSources.length > 0;
+  const maskSource = useMemo(
+    () => sourceImages.find((item) => item.role === "mask") ?? null,
+    [sourceImages],
+  );
   const processingStatus = useMemo(
-    () => (activeRequest ? buildProcessingStatus(activeRequest.mode, submitElapsedSeconds, activeRequest.count) : null),
+    () =>
+      activeRequest
+        ? buildProcessingStatus(
+            activeRequest.mode,
+            submitElapsedSeconds,
+            activeRequest.count,
+            activeRequest.variant,
+          )
+        : null,
     [activeRequest, submitElapsedSeconds],
   );
-  const waitingDots = useMemo(() => buildWaitingDots(submitElapsedSeconds), [submitElapsedSeconds]);
-
-  const syncRuntimeTaskState = useCallback((preferredConversationId?: string | null) => {
-    const tasks = listActiveImageTasks();
-    const nextTask =
-      tasks.find((task) => preferredConversationId && task.conversationId === preferredConversationId) ??
-      tasks[0] ??
-      null;
-
-    setIsSubmitting(tasks.length > 0);
-    setActiveConversationIds(new Set(tasks.map((task) => task.conversationId)));
-    setActiveRequest(
-      nextTask
-        ? {
-            conversationId: nextTask.conversationId,
-            turnId: nextTask.turnId,
-            mode: nextTask.mode,
-            count: nextTask.count,
-            variant: nextTask.variant,
-          }
-        : null,
-    );
-    setSubmitStartedAt(nextTask?.startedAt ?? null);
-    if (!nextTask) {
-      setSubmitElapsedSeconds(0);
-    }
-  }, []);
-
-  const persistConversation = useCallback(
-    async (conversation: ImageConversation) => {
-      const normalizedConversation = normalizeConversation(conversation);
-      await saveImageConversation(normalizedConversation);
-      if (!mountedRef.current) {
-        return normalizedConversation;
-      }
-
-      setConversations((current) =>
-        sortConversations([normalizedConversation, ...current.filter((item) => item.id !== normalizedConversation.id)]),
-      );
-      setSelectedConversationId(normalizedConversation.id);
-      syncRuntimeTaskState(normalizedConversation.id);
-      return normalizedConversation;
-    },
-    [syncRuntimeTaskState],
+  const waitingDots = useMemo(
+    () => buildWaitingDots(submitElapsedSeconds),
+    [submitElapsedSeconds],
   );
-
-  const updateConversation = useCallback(
-    async (
-      conversationId: string,
-      updater: (current: ImageConversation | null) => ImageConversation,
-    ) => {
-      const nextConversation = await updateImageConversation(conversationId, updater);
-      if (!mountedRef.current) {
-        return nextConversation;
-      }
-
-      setConversations((current) =>
-        sortConversations([nextConversation, ...current.filter((item) => item.id !== conversationId)]),
-      );
-      return nextConversation;
-    },
-    [],
-  );
-
-  const resetComposer = useCallback((nextMode: ImageMode = "generate") => {
-    setMode(nextMode);
-    setImagePrompt("");
-    setImageCount("1");
-    setImageSize(sizeOptions[0].value);
-    setImageQuality("high");
-    setUpscaleScale(upscaleOptions[0]);
-    setSourceImages([]);
-  }, []);
-
-  const syncQuotaAfterResult = useCallback(
-    (images: StoredImage[]) => {
-      const sourceAccountId =
-        images.find((item) => item.status === "success" && item.source_account_id)?.source_account_id ??
-        images.find((item) => item.source_account_id)?.source_account_id;
-      if (!sourceAccountId) {
-        return;
-      }
-
-      void (async () => {
-        try {
-          const quota = await fetchAccountQuota(sourceAccountId, { refresh: false });
-          if (!mountedRef.current) {
-            return;
-          }
-
-          setAvailableAccounts((current) => {
-            const next = current.map((account) =>
-              account.id === sourceAccountId ? applyQuotaResultToAccount(account, quota) : account,
-            );
-            setAvailableQuota(formatAvailableQuota(next, workspaceConfig.allowDisabledStudioAccounts));
-            return next;
-          });
-        } catch {
-          // Best-effort UI sync only.
-        }
-      })();
-    },
-    [workspaceConfig.allowDisabledStudioAccounts],
-  );
-
-  const buildDraftTurn = useCallback(
-    ({
-      turnId,
-      nextMode,
-      prompt,
-      count,
-      createdAt,
-      nextSourceImages,
-      nextSize,
-      nextQuality,
-      nextScale,
-    }: {
-      turnId: string;
-      nextMode: ImageMode;
-      prompt: string;
-      count: number;
-      createdAt: string;
-      nextSourceImages: StoredSourceImage[];
-      nextSize?: string;
-      nextQuality?: ImageQuality;
-      nextScale?: string;
-    }): ImageConversationTurn => ({
-      id: turnId,
-      title: buildConversationTitle(nextMode, prompt, nextScale || ""),
-      mode: nextMode,
-      prompt,
-      model: "gpt-image-2",
-      count,
-      size: nextSize,
-      quality: nextQuality,
-      scale: nextScale,
-      sourceImages: nextSourceImages,
-      images: createLoadingImages(count, turnId),
-      createdAt,
-      status: "generating",
-    }),
-    [],
-  );
-
-  const buildSourceFile = useCallback(async (source: StoredSourceImage, fallbackName: string) => {
-    const sourceUrl = buildSourceImageUrl(source);
-    if (!sourceUrl) {
-      throw new Error("源图数据不可用");
-    }
-    return dataUrlToFile(sourceUrl, source.name || fallbackName);
-  }, []);
-
-  const runTurnRequest = useCallback(
-    async (turn: ImageConversationTurn) => {
-      const turnPrompt = turn.prompt.trim();
-      const turnSourceImages = Array.isArray(turn.sourceImages) ? turn.sourceImages : [];
-      const turnImageSources = turnSourceImages.filter((item) => item.role === "image");
-      const turnMaskSource = turnSourceImages.find((item) => item.role === "mask") ?? null;
-
-      if (turn.mode === "generate") {
-        if (turnImageSources.length > 0) {
-          const files = await Promise.all(
-            turnImageSources.map((item, index) => buildSourceFile(item, `reference-${index + 1}.png`)),
-          );
-          const payload = await editImage({
-            prompt: turnPrompt,
-            images: files,
-            model: turn.model,
-          });
-          return mergeResultImages(turn.id, payload.data || [], 1);
-        }
-
-        const payload = await generateImageWithOptions(turnPrompt, {
-          model: turn.model,
-          count: Math.max(1, turn.count || 1),
-          size: turn.size,
-          quality: turn.quality || "high",
-        });
-        return mergeResultImages(turn.id, payload.data || [], Math.max(1, turn.count || 1));
-      }
-
-      if (turn.mode === "edit") {
-        if (turnImageSources.length === 0) {
-          throw new Error("编辑模式至少需要一张源图");
-        }
-
-        const files = await Promise.all(
-          turnImageSources.map((item, index) => buildSourceFile(item, `image-${index + 1}.png`)),
-        );
-        const mask = turnMaskSource ? await buildSourceFile(turnMaskSource, "mask.png") : null;
-        const payload = await editImage({
-          prompt: turnPrompt,
-          images: files,
-          mask,
-          model: turn.model,
-        });
-        return mergeResultImages(turn.id, payload.data || [], 1);
-      }
-
-      if (turnImageSources.length === 0) {
-        throw new Error("放大模式至少需要一张源图");
-      }
-
-      const imageFile = await buildSourceFile(turnImageSources[0], "upscale.png");
-      const payload = await upscaleImage({
-        image: imageFile,
-        prompt: turnPrompt,
-        scale: turn.scale || "2x",
-        model: turn.model,
-      });
-      return mergeResultImages(turn.id, payload.data || [], 1);
-    },
-    [buildSourceFile],
-  );
-
-  const finalizeTurn = useCallback(
-    async (conversationId: string, draftTurn: ImageConversationTurn, resultImages: StoredImage[]) => {
-      const failedCount = countFailures(resultImages);
-      await updateConversation(conversationId, (current) => ({
-        ...(current ?? buildConversationBase(conversationId, draftTurn)),
-        turns: (current?.turns ?? [draftTurn]).map((turn) =>
-          turn.id === draftTurn.id
-            ? {
-                ...turn,
-                images: resultImages,
-                status: failedCount > 0 ? "error" : "success",
-                error: failedCount > 0 ? `其中 ${failedCount} 张处理失败` : undefined,
-              }
-            : turn,
-        ),
-      }));
-      return failedCount;
-    },
-    [updateConversation],
-  );
-
-  const markTurnFailed = useCallback(
-    async (conversationId: string, draftTurn: ImageConversationTurn, message: string) => {
-      await updateConversation(conversationId, (current) => ({
-        ...(current ?? buildConversationBase(conversationId, draftTurn)),
-        turns: (current?.turns ?? [draftTurn]).map((turn) =>
-          turn.id === draftTurn.id
-            ? {
-                ...turn,
-                status: "error",
-                error: message,
-                images: turn.images.map((image) => ({
-                  ...image,
-                  status: "error" as const,
-                  error: message,
-                })),
-              }
-            : turn,
-        ),
-      }));
-    },
-    [updateConversation],
-  );
-
-  const handleModeChange = useCallback((nextMode: ImageMode) => {
-    setMode(nextMode);
-    setSourceImages((current) => {
-      const currentImages = current.filter((item) => item.role === "image");
-      const currentMask = current.find((item) => item.role === "mask") ?? null;
-      if (nextMode === "generate") {
-        return currentImages;
-      }
-      if (nextMode === "edit") {
-        return currentMask ? [...currentImages, currentMask] : currentImages;
-      }
-      return currentImages.length > 0 ? [currentImages[0]] : [];
-    });
-  }, []);
-
-  const handleAppendFiles = useCallback(
-    async (files: FileList | null, role: "image" | "mask") => {
-      if (!files || files.length === 0) {
-        return;
-      }
-
-      try {
-        const nextItems = await Promise.all(
-          Array.from(files).map(async (file) => ({
-            id: makeId(),
-            role,
-            name: file.name,
-            dataUrl: await fileToDataUrl(file),
-          })),
-        );
-
-        if (!mountedRef.current) {
-          return;
-        }
-
-        if (mode === "upscale" && role === "image" && nextItems.length > 1) {
-          toast.warning("放大模式只会保留第一张图片");
-        }
-
-        setSourceImages((current) => {
-          const currentImages = current.filter((item) => item.role === "image");
-          const currentMask = current.find((item) => item.role === "mask") ?? null;
-
-          if (role === "mask") {
-            const latestMask = nextItems[nextItems.length - 1];
-            return [...currentImages, latestMask];
-          }
-
-          const mergedImages =
-            mode === "upscale" ? nextItems.slice(0, 1) : [...currentImages, ...nextItems];
-          if (mode === "edit" && currentMask) {
-            return [...mergedImages, currentMask];
-          }
-          return mergedImages;
-        });
-      } catch (error) {
-        toast.error(error instanceof Error ? error.message : "读取图片失败");
-      }
-    },
-    [mode],
-  );
-
-  const handlePromptPaste = useCallback(
-    async (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
-      const imageFiles = Array.from(event.clipboardData.items)
-        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-        .map((item) => item.getAsFile())
-        .filter((file): file is File => Boolean(file));
-
-      if (imageFiles.length === 0) {
-        return;
-      }
-
-      event.preventDefault();
-      const transfer = new DataTransfer();
-      imageFiles.forEach((file) => transfer.items.add(file));
-      await handleAppendFiles(transfer.files, "image");
-    },
-    [handleAppendFiles],
-  );
-
-  const handleRemoveSourceImage = useCallback((id: string) => {
-    setSourceImages((current) => current.filter((item) => item.id !== id));
-  }, []);
-
-  const handleCreateDraft = useCallback(() => {
-    setSelectedConversationId(null);
-    resetComposer("generate");
-    window.requestAnimationFrame(() => {
-      textareaRef.current?.focus();
-    });
-  }, [resetComposer]);
-
-  const handleApplyPromptExample = useCallback((example: (typeof inspirationExamples)[number]) => {
-    setSelectedConversationId(null);
-    setMode("generate");
-    setImagePrompt(example.prompt);
-    setImageCount("1");
-    setSourceImages([]);
-    window.requestAnimationFrame(() => {
-      textareaRef.current?.focus();
-    });
-  }, []);
-
-  const handleFocusConversation = useCallback((id: string) => {
-    setSelectedConversationId(id);
-  }, []);
-
-  const handleDeleteConversation = useCallback(
-    async (conversationId: string) => {
-      await deleteImageConversation(conversationId);
-      if (!mountedRef.current) {
-        return;
-      }
-
-      setConversations((current) => current.filter((item) => item.id !== conversationId));
-      if (selectedConversationId === conversationId) {
-        const nextConversation = conversations.find((item) => item.id !== conversationId) ?? null;
-        setSelectedConversationId(nextConversation?.id ?? null);
-      }
-    },
-    [conversations, selectedConversationId],
-  );
-
-  const handleClearHistory = useCallback(async () => {
-    await Promise.all(conversations.map((item) => deleteImageConversation(item.id)));
-    if (!mountedRef.current) {
-      return;
-    }
-
-    setConversations([]);
-    setSelectedConversationId(null);
-  }, [conversations]);
-
-  const handleSeedFromResult = useCallback((conversationId: string, image: StoredImage, nextMode: ImageMode) => {
-    const sourceUrl = buildImageDataUrl(image);
-    if (!sourceUrl) {
-      toast.error("当前结果图不可用");
-      return;
-    }
-
-    setSelectedConversationId(conversationId);
-    setMode(nextMode);
-    setImagePrompt("");
-    setImageCount("1");
-    setSourceImages([
-      {
-        id: makeId(),
-        role: "image",
-        name: nextMode === "upscale" ? "upscale-source.png" : "edit-source.png",
-        dataUrl: image.b64_json ? sourceUrl : undefined,
-        url: image.url && !image.b64_json ? image.url : undefined,
-      },
-    ]);
-    window.requestAnimationFrame(() => {
-      textareaRef.current?.focus();
-    });
-  }, []);
-
-  const handlePublishTurnImage = useCallback(
-    async (conversationId: string, turn: ImageConversationTurn, image: StoredImage) => {
-      const imageDataUrl = buildImageDataUrl(image);
-      if (!imageDataUrl) {
-        toast.error("当前结果图不可用");
-        return;
-      }
-
-      const recordKey = buildGalleryPublishRecordKey(conversationId, turn.id, image.id);
-      if (publishedRecords[recordKey]) {
-        toast.message("这张图片已经发布过了");
-        return;
-      }
-
-      setPublishingImageKey(recordKey);
-      try {
-        const prompt = buildGalleryWorkPrompt(turn);
-        const payload = await publishPortalGalleryWork({
-          title: buildGalleryWorkTitle(turn),
-          prompt,
-          image_data_url: imageDataUrl.startsWith("data:") ? imageDataUrl : undefined,
-          image_url: imageDataUrl.startsWith("data:") ? undefined : imageDataUrl,
-          model: turn.model,
-          size: turn.size,
-        });
-
-        const record = {
-          key: recordKey,
-          work_id: payload.item.id,
-          published_at: new Date().toISOString(),
-        };
-        await saveGalleryPublishRecord(record);
-        if (!mountedRef.current) {
-          return;
-        }
-
-        setPublishedRecords((current) => ({
-          ...current,
-          [recordKey]: record,
-        }));
-        toast.success("已发布到作品广场");
-      } catch (error) {
-        toast.error(error instanceof Error ? error.message : "发布失败");
-      } finally {
-        if (mountedRef.current) {
-          setPublishingImageKey(null);
-        }
-      }
-    },
-    [publishedRecords],
-  );
-
-  const handleRetryTurn = useCallback(
-    async (conversationId: string, turn: ImageConversationTurn) => {
-      if (isSubmitting) {
-        toast.error("正在处理中，请稍后再试");
-        return;
-      }
-
-      const prompt = turn.prompt.trim();
-      const turnMode = turn.mode || "generate";
-      const turnSourceImages = Array.isArray(turn.sourceImages) ? turn.sourceImages : [];
-      const turnImageSources = turnSourceImages.filter((item) => item.role === "image");
-      const turnScale = turnMode === "upscale" ? turn.scale || "2x" : undefined;
-      const expectedCount = Math.max(1, turn.count || 1);
-
-      if (turnMode === "generate" && !prompt) {
-        toast.error("该记录缺少提示词，无法重试");
-        return;
-      }
-      if (turnMode === "edit" && (!prompt || turnImageSources.length === 0)) {
-        toast.error("该记录缺少编辑所需信息，无法重试");
-        return;
-      }
-      if (turnMode === "upscale" && turnImageSources.length === 0) {
-        toast.error("该记录缺少待放大图片，无法重试");
-        return;
-      }
-
-      const now = new Date().toISOString();
-      const draftTurn = buildDraftTurn({
-        turnId: turn.id,
-        nextMode: turnMode,
-        prompt,
-        count: expectedCount,
-        createdAt: now,
-        nextSourceImages: turnSourceImages,
-        nextSize: turn.size,
-        nextQuality: turnMode === "generate" && turnImageSources.length === 0 ? turn.quality || "high" : undefined,
-        nextScale: turnScale,
-      });
-
-      const startedAt = Date.now();
-      setSelectedConversationId(conversationId);
-      setIsSubmitting(true);
-      setActiveRequest({
-        conversationId,
-        turnId: turn.id,
-        mode: turnMode,
-        count: expectedCount,
-        variant: "standard",
-      });
-      setSubmitElapsedSeconds(0);
-      setSubmitStartedAt(startedAt);
-      startImageTask({
-        conversationId,
-        turnId: turn.id,
-        mode: turnMode,
-        count: expectedCount,
-        variant: "standard",
-        startedAt,
-      });
-
-      try {
-        await updateConversation(conversationId, (current) => {
-          const currentTurns = current?.turns ?? [];
-          const nextTurns = currentTurns.some((item) => item.id === turn.id)
-            ? currentTurns.map((item) => (item.id === turn.id ? draftTurn : item))
-            : [...currentTurns, draftTurn];
-          return {
-            ...(current ?? buildConversationBase(conversationId, draftTurn)),
-            turns: nextTurns,
-          };
-        });
-
-        const resultImages = await runTurnRequest(draftTurn);
-        syncQuotaAfterResult(resultImages);
-        const failedCount = await finalizeTurn(conversationId, draftTurn, resultImages);
-
-        if (failedCount > 0) {
-          toast.error(`已返回结果，但有 ${failedCount} 张处理失败`);
-        } else {
-          toast.success(
-            turnMode === "generate" ? "图片已生成" : turnMode === "edit" ? "图片已编辑" : "图片已放大",
-          );
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "图片任务失败";
-        await markTurnFailed(conversationId, draftTurn, message);
-        toast.error(message);
-      } finally {
-        finishImageTask(conversationId, turn.id);
-        setIsSubmitting(false);
-        setActiveRequest(null);
-        setSubmitStartedAt(null);
-        setSubmitElapsedSeconds(0);
-      }
-    },
-    [buildDraftTurn, finalizeTurn, isSubmitting, markTurnFailed, runTurnRequest, syncQuotaAfterResult, updateConversation],
-  );
-
-  const handleSubmit = useCallback(async () => {
-    const prompt = imagePrompt.trim();
-    if (!prompt && mode !== "upscale") {
-      toast.error("请输入提示词");
-      return;
-    }
-    if (mode === "edit" && imageSources.length === 0) {
-      toast.error("编辑模式至少需要一张源图");
-      return;
-    }
-    if (mode === "upscale" && imageSources.length === 0) {
-      toast.error("放大模式至少需要一张源图");
-      return;
-    }
-
-    const conversationId = selectedConversationId ?? makeId();
-    const turnId = makeId();
-    const expectedCount = mode === "generate" && imageSources.length === 0 ? parsedCount : 1;
-    const now = new Date().toISOString();
-    const draftTurn = buildDraftTurn({
-      turnId,
-      nextMode: mode,
-      prompt,
-      count: expectedCount,
-      createdAt: now,
-      nextSourceImages: sourceImages,
-      nextSize: mode === "generate" ? imageSize : undefined,
-      nextQuality: mode === "generate" && imageSources.length === 0 ? imageQuality : undefined,
-      nextScale: mode === "upscale" ? upscaleScale : undefined,
-    });
-
-    const startedAt = Date.now();
-    setSelectedConversationId(conversationId);
-    setIsSubmitting(true);
-    setActiveRequest({
-      conversationId,
-      turnId,
-      mode,
-      count: expectedCount,
-      variant: "standard",
-    });
-    setSubmitElapsedSeconds(0);
-    setSubmitStartedAt(startedAt);
-    setImagePrompt("");
-    setSourceImages([]);
-    startImageTask({
-      conversationId,
-      turnId,
-      mode,
-      count: expectedCount,
-      variant: "standard",
-      startedAt,
-    });
-
-    try {
-      if (selectedConversationId) {
-        await updateConversation(conversationId, (current) => ({
-          ...(current ?? buildConversationBase(conversationId, draftTurn)),
-          turns: [...(current?.turns ?? []), draftTurn],
-        }));
-      } else {
-        await persistConversation(buildConversationBase(conversationId, draftTurn));
-      }
-
-      const resultImages = await runTurnRequest(draftTurn);
-      syncQuotaAfterResult(resultImages);
-      const failedCount = await finalizeTurn(conversationId, draftTurn, resultImages);
-
-      resetComposer(mode);
-      if (failedCount > 0) {
-        toast.error(`已返回结果，但有 ${failedCount} 张处理失败`);
-      } else {
-        toast.success(
-          mode === "generate"
-            ? hasGenerateReferences
-              ? "参考图生成已完成"
-              : "图片已生成"
-            : mode === "edit"
-              ? "图片已编辑"
-              : "图片已放大",
-        );
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "图片任务失败";
-      await markTurnFailed(conversationId, draftTurn, message);
-      toast.error(message);
-    } finally {
-      finishImageTask(conversationId, turnId);
-      setIsSubmitting(false);
-      setActiveRequest(null);
-      setSubmitStartedAt(null);
-      setSubmitElapsedSeconds(0);
-    }
-  }, [
-    buildDraftTurn,
-    finalizeTurn,
-    hasGenerateReferences,
-    imagePrompt,
-    imageQuality,
-    imageSize,
-    imageSources.length,
-    markTurnFailed,
-    mode,
-    parsedCount,
-    persistConversation,
-    resetComposer,
-    runTurnRequest,
-    selectedConversationId,
-    sourceImages,
-    syncQuotaAfterResult,
-    upscaleScale,
-    updateConversation,
-  ]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -2017,62 +937,372 @@ export default function ImagePage() {
   }, []);
 
   useEffect(() => {
-    if (didLoadBootstrapRef.current) {
-      return;
+    const media = window.matchMedia("(min-width: 1024px)");
+    const updateLayout = (matches: boolean) => {
+      setIsDesktopLayout(matches);
+    };
+
+    updateLayout(media.matches);
+    const handleChange = (event: MediaQueryListEvent) =>
+      updateLayout(event.matches);
+    if (typeof media.addEventListener === "function") {
+      media.addEventListener("change", handleChange);
+      return () => media.removeEventListener("change", handleChange);
     }
-    didLoadBootstrapRef.current = true;
 
-    const loadWorkspace = async () => {
+    media.addListener(handleChange);
+    return () => media.removeListener(handleChange);
+  }, []);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      void refreshHistory({ normalize: true, withLoading: true });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let reconnectTimer: number | null = null;
+    let pollingTimer: number | null = null;
+    let streamAbort: AbortController | null = null;
+
+    const applyTaskPayload = (items: ImageTaskView[], snapshot: ImageTaskSnapshot) => {
+      if (disposed) {
+        return;
+      }
+      setTaskItems(items);
+      setTaskSnapshot(snapshot);
+    };
+
+    const loadTasks = async () => {
       try {
-        const [historyItems, bootstrap, publishRecords] = await Promise.all([
-          listImageConversations(),
-          fetchPortalWorkspaceBootstrap(),
-          listGalleryPublishRecords(),
-        ]);
-        const normalizedHistory = await normalizeConversationHistory(historyItems);
-        if (!mountedRef.current) {
-          return;
-        }
-
-        const allowDisabledStudioAccounts = bootstrap.workspace.allow_disabled_studio_accounts;
-        setConversations(normalizedHistory);
-        setSelectedConversationId(normalizedHistory[0]?.id ?? null);
-        setAvailableAccounts(bootstrap.accounts);
-        setWorkspaceConfig({ allowDisabledStudioAccounts });
-        setAvailableQuota(formatAvailableQuota(bootstrap.accounts, allowDisabledStudioAccounts));
-        setPublishedRecords(publishRecords);
-        syncRuntimeTaskState(normalizedHistory[0]?.id ?? null);
-      } catch (error) {
-        setAvailableQuota("—");
-        toast.error(error instanceof Error ? error.message : "初始化图片工作台失败");
-      } finally {
-        if (mountedRef.current) {
-          setIsLoadingHistory(false);
+        const payload = await listImageTasks();
+        applyTaskPayload(payload.items, payload.snapshot);
+      } catch {
+        if (!disposed) {
+          setTaskItems([]);
+          setTaskSnapshot(buildEmptyTaskSnapshot());
         }
       }
     };
 
-    void loadWorkspace();
-  }, [syncRuntimeTaskState]);
-
-  useEffect(() => {
-    syncRuntimeTaskState(selectedConversationId);
-    const unsubscribe = () => {
-      syncRuntimeTaskState(selectedConversationId);
+    const startPolling = () => {
+      if (pollingTimer !== null) {
+        return;
+      }
+      void loadTasks();
+      pollingTimer = window.setInterval(() => {
+        void loadTasks();
+      }, 2000);
     };
-    const stop = subscribeImageTasks(unsubscribe);
+
+    const stopPolling = () => {
+      if (pollingTimer !== null) {
+        window.clearInterval(pollingTimer);
+        pollingTimer = null;
+      }
+    };
+
+    const startStream = () => {
+      streamAbort = new AbortController();
+      void consumeImageTaskStream(
+        {
+          onInit: ({ items, snapshot }) => {
+            stopPolling();
+            applyTaskPayload(items, snapshot);
+          },
+          onEvent: (event) => {
+            setTaskItems((prev) => reduceTaskItems(prev, event));
+            if (event.snapshot) {
+              setTaskSnapshot(event.snapshot);
+            }
+          },
+        },
+        streamAbort.signal,
+      ).catch(() => {
+        if (disposed) {
+          return;
+        }
+        startPolling();
+        reconnectTimer = window.setTimeout(() => {
+          if (!disposed) {
+            startStream();
+          }
+        }, 3000);
+      });
+    };
+
+    startPolling();
+    startStream();
+
     return () => {
-      stop();
+      disposed = true;
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+      stopPolling();
+      streamAbort?.abort();
     };
-  }, [selectedConversationId, syncRuntimeTaskState]);
+  }, []);
 
   useEffect(() => {
-    if (!isSubmitting || submitStartedAt === null) {
+    const completedTasks = taskItems.filter(
+      (task) =>
+        task.status === "succeeded" &&
+        !quotaSyncedTaskIdsRef.current.has(task.id),
+    );
+    if (completedTasks.length === 0) {
+      return;
+    }
+
+    const accountIDs = new Set<string>();
+    for (const task of completedTasks) {
+      quotaSyncedTaskIdsRef.current.add(task.id);
+      for (const image of task.images) {
+        if (image.source_account_id) {
+          accountIDs.add(image.source_account_id);
+        }
+      }
+    }
+    if (accountIDs.size === 0) {
+      return;
+    }
+
+    void (async () => {
+      for (const accountID of accountIDs) {
+        try {
+          const quota = await fetchAccountQuota(accountID, { refresh: false });
+          setAvailableAccounts((prev) => {
+            const next = prev.map((account) =>
+              account.id === accountID
+                ? applyQuotaResultToAccount(account, quota)
+                : account,
+            );
+            setAvailableQuota(
+              formatAvailableQuota(next, allowDisabledStudioAccounts),
+            );
+            return next;
+          });
+        } catch {
+          // Best-effort UI sync only; keep the current snapshot when it fails.
+        }
+      }
+    })();
+  }, [allowDisabledStudioAccounts, taskItems]);
+
+  useEffect(() => {
+    const loadQuota = async () => {
+      try {
+        const [accountsData, configData] = await Promise.all([
+          fetchAccounts(),
+          fetchConfig(),
+        ]);
+        const allowDisabled =
+          configData.chatgpt.imageMode === "studio" &&
+          configData.chatgpt.studioAllowDisabledImageAccounts;
+        setAllowDisabledStudioAccounts(allowDisabled);
+        setConfiguredImageMode(configData.chatgpt.imageMode);
+        setConfiguredFreeImageRoute(configData.chatgpt.freeImageRoute);
+        setAvailableAccounts(accountsData.items);
+        setAvailableQuota(
+          formatAvailableQuota(accountsData.items, allowDisabled),
+        );
+      } catch {
+        setAvailableAccounts([]);
+        setAllowDisabledStudioAccounts(false);
+        setConfiguredImageMode("studio");
+        setConfiguredFreeImageRoute("legacy");
+        setAvailableQuota((prev) => (prev === "加载中" ? "—" : prev));
+      }
+    };
+
+    if (didLoadQuotaRef.current) {
+      return;
+    }
+    didLoadQuotaRef.current = true;
+    void loadQuota();
+  }, []);
+
+  useEffect(() => {
+    const selectedPreset = currentResolutionPresets.find(
+      (item) => item.tier === imageResolutionTier,
+    );
+    if (
+      selectedPreset &&
+      (hasAvailablePaidAccount || selectedPreset.access === "free")
+    ) {
+      return;
+    }
+    const nextPreset = currentResolutionPresets.find(
+      (item) => hasAvailablePaidAccount || item.access === "free",
+    );
+    if (nextPreset && nextPreset.tier !== imageResolutionTier) {
+      setImageResolutionTier(nextPreset.tier);
+    }
+  }, [currentResolutionPresets, hasAvailablePaidAccount, imageResolutionTier]);
+
+  useEffect(() => {
+    if (!isImageQualityEnabled && imageQuality !== "high") {
+      setImageQuality("high");
+    }
+  }, [imageQuality, isImageQualityEnabled]);
+
+  const scrollToBottom = useCallback(
+    (behavior: ScrollBehavior = "smooth") => {
+      if (isStandaloneWorkspace) {
+        const scrollTarget = document.scrollingElement;
+        if (!scrollTarget) {
+          return;
+        }
+
+        window.scrollTo({
+          top: scrollTarget.scrollHeight,
+          behavior,
+        });
+        return;
+      }
+
+      const viewport = resultsViewportRef.current;
+      if (!viewport) {
+        return;
+      }
+
+      viewport.scrollTo({
+        top: viewport.scrollHeight,
+        behavior,
+      });
+    },
+    [isStandaloneWorkspace],
+  );
+
+  useEffect(() => {
+    if (isStandaloneWorkspace) {
+      const updateScrollState = () => {
+        const scrollTarget = document.scrollingElement;
+        if (!scrollTarget) {
+          return;
+        }
+        const scrollTop = window.scrollY || scrollTarget.scrollTop;
+        const viewportHeight = window.innerHeight;
+        const hiddenHeight =
+          scrollTarget.scrollHeight - viewportHeight - scrollTop;
+        const hasOverflow = scrollTarget.scrollHeight > viewportHeight + 24;
+        const nearBottom = hiddenHeight <= 96;
+        isNearBottomRef.current = nearBottom;
+        setShowScrollToBottom(hasOverflow && !nearBottom);
+      };
+
+      updateScrollState();
+      window.addEventListener("scroll", updateScrollState, { passive: true });
+      window.addEventListener("resize", updateScrollState);
+
+      return () => {
+        window.removeEventListener("scroll", updateScrollState);
+        window.removeEventListener("resize", updateScrollState);
+      };
+    }
+
+    const viewport = resultsViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    const updateScrollState = () => {
+      const hiddenHeight =
+        viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop;
+      const hasOverflow = viewport.scrollHeight > viewport.clientHeight + 24;
+      const nearBottom = hiddenHeight <= 96;
+      isNearBottomRef.current = nearBottom;
+      setShowScrollToBottom(hasOverflow && !nearBottom);
+    };
+
+    updateScrollState();
+    viewport.addEventListener("scroll", updateScrollState, { passive: true });
+    window.addEventListener("resize", updateScrollState);
+
+    return () => {
+      viewport.removeEventListener("scroll", updateScrollState);
+      window.removeEventListener("resize", updateScrollState);
+    };
+  }, [
+    isStandaloneWorkspace,
+    selectedConversationId,
+    selectedConversationTurns.length,
+    selectedConversationLastTurnKey,
+  ]);
+
+  useEffect(() => {
+    const conversationChanged =
+      previousSelectedConversationIdRef.current !== selectedConversationId;
+    const turnCountIncreased =
+      selectedConversationTurns.length > previousTurnCountRef.current;
+    const lastTurnChanged =
+      previousLastTurnKeyRef.current !== selectedConversationLastTurnKey;
+
+    previousSelectedConversationIdRef.current = selectedConversationId;
+    previousTurnCountRef.current = selectedConversationTurns.length;
+    previousLastTurnKeyRef.current = selectedConversationLastTurnKey;
+
+    if (!selectedConversation && !hasActiveTasks) {
+      return;
+    }
+
+    if (
+      !conversationChanged &&
+      !turnCountIncreased &&
+      !(lastTurnChanged && isNearBottomRef.current)
+    ) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      scrollToBottom(conversationChanged ? "auto" : "smooth");
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+    };
+  }, [
+    hasActiveTasks,
+    scrollToBottom,
+    selectedConversation,
+    selectedConversationId,
+    selectedConversationLastTurnKey,
+    selectedConversationTurns.length,
+  ]);
+
+  useEffect(() => {
+    if (!isStandaloneWorkspace || !selectedConversationId) {
+      return;
+    }
+
+    const firstFrame = window.requestAnimationFrame(() => {
+      const secondFrame = window.requestAnimationFrame(() => {
+        scrollToBottom("auto");
+      });
+      return () => window.cancelAnimationFrame(secondFrame);
+    });
+
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+    };
+  }, [isStandaloneWorkspace, scrollToBottom, selectedConversationId]);
+
+  useEffect(() => {
+    if (activeRequestStartedAt === null) {
+      setSubmitElapsedSeconds(0);
       return;
     }
 
     const updateElapsed = () => {
-      setSubmitElapsedSeconds(Math.max(0, Math.floor((Date.now() - submitStartedAt) / 1000)));
+      setSubmitElapsedSeconds(
+        Math.max(0, Math.floor((Date.now() - activeRequestStartedAt) / 1000)),
+      );
     };
 
     updateElapsed();
@@ -2080,7 +1310,7 @@ export default function ImagePage() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [isSubmitting, submitStartedAt]);
+  }, [activeRequestStartedAt]);
 
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -2089,112 +1319,414 @@ export default function ImagePage() {
     }
 
     textarea.style.height = "auto";
-    const maxHeight = Math.min(480, Math.max(180, Math.floor(window.innerHeight * 0.42)));
+    const maxHeight = Math.min(
+      480,
+      Math.max(260, Math.floor(window.innerHeight * 0.42)),
+    );
     textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
   }, [imagePrompt, mode]);
 
   useEffect(() => {
-    const viewport = resultsViewportRef.current;
-    if (!viewport) {
-      return;
-    }
+    window.dispatchEvent(
+      new CustomEvent("chatgpt-image-studio:mobile-workspace-title", {
+        detail: { title: selectedConversation?.title ?? null },
+      }),
+    );
+  }, [selectedConversation?.title]);
 
-    const frame = window.requestAnimationFrame(() => {
-      viewport.scrollTo({
-        top: viewport.scrollHeight,
-        behavior: "smooth",
+  const persistConversation = useCallback(
+    async (conversation: ImageConversation) => {
+      const normalizedConversation = normalizeConversation(conversation);
+      if (mountedRef.current) {
+        draftSelectionRef.current = false;
+        setSelectedConversationId(normalizedConversation.id);
+        setConversations((prev) => {
+          const next = [
+            normalizedConversation,
+            ...prev.filter((item) => item.id !== normalizedConversation.id),
+          ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+          return next;
+        });
+      }
+      await saveImageConversation(normalizedConversation);
+    },
+    [setConversations, setSelectedConversationId],
+  );
+
+  const updateConversation = useCallback(
+    async (
+      conversationId: string,
+      updater: (current: ImageConversation | null) => ImageConversation,
+    ) => {
+      if (mountedRef.current) {
+        setConversations((prev) => {
+          const currentConversation =
+            prev.find((item) => item.id === conversationId) ?? null;
+          const optimisticConversation = normalizeConversation(
+            updater(currentConversation),
+          );
+          const next = [
+            optimisticConversation,
+            ...prev.filter((item) => item.id !== conversationId),
+          ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+          return next;
+        });
+      }
+
+      const nextConversation = await updateImageConversation(
+        conversationId,
+        updater,
+      );
+      if (!mountedRef.current) {
+        return;
+      }
+      setConversations((prev) => {
+        const next = [
+          nextConversation,
+          ...prev.filter((item) => item.id !== conversationId),
+        ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        return next;
       });
+    },
+    [setConversations],
+  );
+
+  useEffect(() => {
+    for (const task of taskItems) {
+      if (!["succeeded", "failed", "cancelled", "expired"].includes(task.status)) {
+        continue;
+      }
+      if (!task.conversationId.trim()) {
+        continue;
+      }
+      if (!displayedConversations.some((item) => item.id === task.conversationId)) {
+        continue;
+      }
+      if (persistedTaskStatesRef.current[task.id] === task.status) {
+        continue;
+      }
+      persistedTaskStatesRef.current[task.id] = task.status;
+      void updateConversation(task.conversationId, (current) => {
+        if (!current) {
+          return normalizeConversation({
+            id: task.conversationId,
+            title: "",
+            mode: "generate",
+            prompt: "",
+            model: "gpt-image-2",
+            count: task.count,
+            images: [],
+            createdAt: task.createdAt,
+            status: "error",
+            turns: [],
+          } as ImageConversation);
+        }
+        return applyTaskViewToConversation(
+          current,
+          new Map([[`${task.conversationId}:${task.turnId}`, [task]]]),
+        );
+      });
+    }
+  }, [displayedConversations, taskItems, updateConversation]);
+
+  const resetComposer = useCallback(
+    (nextMode: ImageMode = mode) => {
+      setMode(nextMode);
+      setImagePrompt("");
+      setImageCount("1");
+      setSourceImages([]);
+    },
+    [mode, setSourceImages],
+  );
+
+  const openHistoryView = useCallback(() => {
+    navigate("/image/history");
+  }, [navigate]);
+
+  const openWorkspaceView = useCallback(() => {
+    navigate("/image/workspace");
+  }, [navigate]);
+
+  const handleCreateDraftAndOpenWorkspace = useCallback(() => {
+    handleCreateDraft(resetComposer, textareaRef);
+    openWorkspaceView();
+  }, [handleCreateDraft, openWorkspaceView, resetComposer]);
+
+  const handleFocusConversationAndOpenWorkspace = useCallback(
+    (conversationId: string) => {
+      focusConversation(conversationId);
+      openWorkspaceView();
+    },
+    [focusConversation, openWorkspaceView],
+  );
+
+  const applyPromptExample = useCallback(
+    (example: (typeof inspirationExamples)[number]) => {
+      setMode("generate");
+      setImageCount(String(example.count));
+      setImagePrompt(example.prompt);
+      openDraftConversation();
+      setSourceImages([]);
+      textareaRef.current?.focus();
+    },
+    [openDraftConversation, setSourceImages],
+  );
+
+  const { handleSelectionEditSubmit, handleRetryTurn, handleSubmit } =
+    useImageSubmit({
+      mode,
+      imagePrompt,
+      imageModel: "gpt-image-2",
+      imageSources,
+      maskSource,
+      sourceImages,
+      parsedCount,
+      imageSize,
+      imageResolutionAccess,
+      imageQuality,
+      selectedConversationId,
+      editorTarget,
+      makeId,
+      focusConversation,
+      closeSelectionEditor,
+      setImagePrompt,
+      setSourceImages,
+      setSubmitElapsedSeconds,
+      persistConversation,
+      updateConversation,
+      resetComposer,
     });
 
-    return () => {
-      window.cancelAnimationFrame(frame);
-    };
-  }, [activeRequest?.turnId, selectedConversationId, selectedConversationTurns.length]);
+  const handleCancelTurn = useCallback(
+    async (conversationId: string, turn: ImageConversationTurn) => {
+      const runtimeTask =
+        activeTaskByTurnKey.get(`${conversationId}:${turn.id}`) ??
+        (turn.taskId ? activeTaskById.get(turn.taskId.trim()) : null) ??
+        null;
+      const taskId = runtimeTask?.id || "";
+      if (!taskId) {
+        toast.warning("任务还在创建中，请稍后再试");
+        return;
+      }
+      if (cancellingTaskIdsRef.current.has(taskId)) {
+        return;
+      }
+
+      cancellingTaskIdsRef.current.add(taskId);
+      setCancellingTaskIds((prev) =>
+        prev.includes(taskId) ? prev : [...prev, taskId],
+      );
+
+      try {
+        const result = await cancelImageTask(taskId);
+        setTaskItems((prev) =>
+          reduceTaskItems(prev, {
+            type: "task.upsert",
+            task: result.task,
+          }),
+        );
+        setTaskSnapshot(result.snapshot);
+        toast.success(
+          result.task.status === "cancel_requested"
+            ? "已提交取消请求，等待当前执行结束"
+            : "已取消排队任务",
+        );
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "取消任务失败");
+      } finally {
+        cancellingTaskIdsRef.current.delete(taskId);
+        setCancellingTaskIds((prev) => prev.filter((item) => item !== taskId));
+      }
+    },
+    [activeTaskById, activeTaskByTurnKey],
+  );
+
+  const historyPanel = (
+    <HistorySidebar
+      conversations={displayedConversations}
+      selectedConversationId={selectedConversationId}
+      isLoadingHistory={isLoadingHistory}
+      hasActiveTasks={hasActiveTasks}
+      activeConversationIds={activeConversationIds}
+      modeLabelMap={modeLabelMap}
+      buildConversationPreviewSource={buildConversationPreviewSource}
+      formatConversationTime={formatConversationTime}
+      onCreateDraft={handleCreateDraftAndOpenWorkspace}
+      onClearHistory={handleClearHistory}
+      onFocusConversation={handleFocusConversationAndOpenWorkspace}
+      onDeleteConversation={handleDeleteConversation}
+      standalone={isStandaloneHistory}
+    />
+  );
+
+  const workspacePanel = (
+    <div
+      className={cn(
+        "order-1 flex flex-col overflow-visible lg:order-none lg:min-h-0 lg:overflow-hidden",
+        isStandaloneWorkspace
+          ? "rounded-none border-0 bg-transparent shadow-none"
+          : "rounded-[30px] border border-stone-200 bg-white shadow-[0_14px_40px_rgba(15,23,42,0.05)] transition-colors duration-200 dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel)] dark:shadow-[0_20px_60px_-36px_rgba(0,0,0,0.78)]",
+      )}
+    >
+      <WorkspaceHeader
+        historyCollapsed={historyCollapsed}
+        selectedConversationTitle={selectedConversation?.title}
+        runningCount={displayTaskSnapshot.running}
+        maxRunningCount={displayTaskSnapshot.maxRunning}
+        queuedCount={displayTaskSnapshot.queued}
+        workspaceActiveCount={displayTaskSnapshot.activeSources.workspace}
+        compatActiveCount={displayTaskSnapshot.activeSources.compat}
+        cancelledCount={displayTaskSnapshot.finalStatuses.cancelled}
+        expiredCount={displayTaskSnapshot.finalStatuses.expired}
+        onToggleHistory={() => setHistoryCollapsed((current) => !current)}
+        showHistoryToggle={!isStandaloneWorkspace}
+      />
+
+      <div
+        className={cn(
+          "relative min-h-[240px] lg:min-h-0 lg:flex-1",
+          isStandaloneWorkspace ? "bg-transparent" : "bg-[#fcfcfb] dark:bg-[var(--studio-panel-soft)]",
+        )}
+      >
+        <div
+          ref={resultsViewportRef}
+          className={cn(
+            "hide-scrollbar min-h-[240px] overflow-visible lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pb-0",
+            isMobileComposerCollapsed
+              ? "pb-[68px] sm:pb-[74px]"
+              : "pb-[228px] sm:pb-[244px]",
+          )}
+        >
+          {!selectedConversation ? (
+            <EmptyState
+              inspirationExamples={inspirationExamples}
+              onApplyPromptExample={applyPromptExample}
+            />
+          ) : (
+            <ConversationTurns
+              conversationId={selectedConversation.id}
+              turns={selectedConversationTurns}
+              modeLabelMap={modeLabelMap}
+              activeRequest={activeRequest}
+              activeTaskByTurnId={selectedConversationActiveTaskByTurnId}
+              cancellingTaskIds={cancellingTaskIds}
+              processingStatus={processingStatus}
+              waitingDots={waitingDots}
+              submitElapsedSeconds={submitElapsedSeconds}
+              formatConversationTime={formatConversationTime}
+              formatProcessingDuration={formatProcessingDuration}
+              onOpenSelectionEditor={openSelectionEditor}
+              onSeedFromResult={seedFromResult}
+              onRetryTurn={handleRetryTurn}
+              onCancelTurn={handleCancelTurn}
+            />
+          )}
+        </div>
+        {showScrollToBottom ? (
+          <button
+            type="button"
+            onClick={() => scrollToBottom("smooth")}
+            className={cn(
+              "absolute right-4 z-10 inline-flex size-11 items-center justify-center rounded-full border border-stone-200 bg-white/95 text-stone-700 shadow-lg shadow-stone-300/30 backdrop-blur transition hover:bg-white hover:text-stone-950 dark:border-[var(--studio-border)] dark:bg-[color:var(--studio-panel-soft)] dark:text-[var(--studio-text)] dark:shadow-black/40 dark:hover:bg-[var(--studio-panel-muted)] dark:hover:text-[var(--studio-text-strong)] sm:right-5 lg:bottom-5",
+              isMobileComposerCollapsed
+                ? "bottom-[52px] sm:bottom-[60px]"
+                : "bottom-[150px] sm:bottom-[164px]",
+            )}
+            aria-label="滚动到底部"
+            title="滚动到底部"
+          >
+            <ChevronsDown className="size-5" />
+          </button>
+        ) : null}
+      </div>
+
+      <PromptComposer
+        mode={mode}
+        modeOptions={modeOptions}
+        imageCount={imageCount}
+        imageAspectRatio={imageAspectRatio}
+        imageAspectRatioOptions={imageAspectRatioOptions}
+        imageResolutionTier={imageResolutionTier}
+        imageResolutionTierLabel={imageResolutionTierLabel}
+        imageResolutionTierOptions={imageResolutionTierOptions}
+        imageSizeHint={imageSizeHint}
+        imageQuality={imageQuality}
+        imageQualityOptions={imageQualityOptions}
+        imageQualityDisabled={!isImageQualityEnabled}
+        imageQualityDisabledReason={imageQualityDisabledReason}
+        availableQuota={availableQuota}
+        sourceImages={sourceImages}
+        imagePrompt={imagePrompt}
+        textareaRef={textareaRef}
+        uploadInputRef={uploadInputRef}
+        maskInputRef={maskInputRef}
+        onModeChange={setMode}
+        onImageCountChange={setImageCount}
+        onImageAspectRatioChange={(value) =>
+          setImageAspectRatio(value as ImageAspectRatio)
+        }
+        onImageResolutionTierChange={(value) =>
+          setImageResolutionTier(value as ImageResolutionTier)
+        }
+        onImageQualityChange={(value) => setImageQuality(value as ImageQuality)}
+        onPromptChange={setImagePrompt}
+        onPromptPaste={handlePromptPaste}
+        onRemoveSourceImage={removeSourceImage}
+        onOpenSourceSelectionEditor={openSourceSelectionEditor}
+        onAppendFiles={appendFiles}
+        onMobileCollapsedChange={setIsMobileComposerCollapsed}
+        onSubmit={handleSubmit}
+      />
+    </div>
+  );
 
   return (
     <section
       className={cn(
         "grid grid-cols-1 gap-3 lg:h-full lg:min-h-0",
-        historyCollapsed ? "lg:grid-cols-[minmax(0,1fr)]" : "lg:grid-cols-[320px_minmax(0,1fr)]",
+        isStandaloneHistory || isStandaloneWorkspace
+          ? "grid-rows-[auto]"
+          : historyCollapsed
+            ? "grid-rows-[auto] lg:grid-cols-[minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]"
+            : "grid-rows-[auto_auto] lg:grid-cols-[320px_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]",
       )}
     >
-      {!historyCollapsed ? (
-        <HistorySidebar
-          conversations={conversations}
-          selectedConversationId={selectedConversationId}
-          isLoadingHistory={isLoadingHistory}
-          hasActiveTasks={isSubmitting}
-          activeConversationIds={activeConversationIds}
-          onCreateDraft={handleCreateDraft}
-          onClearHistory={handleClearHistory}
-          onFocusConversation={handleFocusConversation}
-          onDeleteConversation={handleDeleteConversation}
-        />
+      {isStandaloneHistory ? historyPanel : null}
+      {isStandaloneWorkspace ? workspacePanel : null}
+      {!isStandaloneHistory && !isStandaloneWorkspace ? (
+        <>
+          {!historyCollapsed ? historyPanel : null}
+          {workspacePanel}
+        </>
       ) : null}
 
-      <div className="order-1 flex flex-col overflow-visible rounded-[30px] border border-stone-200 bg-white shadow-[0_14px_40px_rgba(15,23,42,0.05)] lg:order-none lg:min-h-0 lg:overflow-hidden">
-        <WorkspaceHeader
-          historyCollapsed={historyCollapsed}
-          selectedConversationTitle={selectedConversation?.title ?? null}
-          onToggleHistory={() => setHistoryCollapsed((current) => !current)}
-        />
-
-        <div className="relative min-h-[240px] bg-[#fcfcfb] lg:min-h-0 lg:flex-1">
-          <div
-            ref={resultsViewportRef}
-            className={cn(
-              "hide-scrollbar min-h-[240px] overflow-visible lg:h-full lg:min-h-0 lg:overflow-y-auto lg:pb-0",
-              isMobileComposerCollapsed ? "pb-[88px] sm:pb-[96px]" : "pb-[320px] sm:pb-[340px]",
-            )}
-          >
-            {!selectedConversation ? (
-              <EmptyState onApplyPromptExample={handleApplyPromptExample} />
-            ) : (
-              <ConversationTurns
-                conversationId={selectedConversation.id}
-                turns={selectedConversationTurns}
-                activeRequest={activeRequest}
-                isSubmitting={isSubmitting}
-                processingStatus={processingStatus}
-                waitingDots={waitingDots}
-                submitElapsedSeconds={submitElapsedSeconds}
-                publishedImageKeys={publishedImageKeys}
-                publishingImageKey={publishingImageKey}
-                onSeedFromResult={handleSeedFromResult}
-                onPublishImage={handlePublishTurnImage}
-                onRetryTurn={handleRetryTurn}
-              />
-            )}
-          </div>
-        </div>
-
-        <PromptComposer
-          mode={mode}
-          imageCount={imageCount}
-          imageSize={imageSize}
-          imageQuality={imageQuality}
-          upscaleScale={upscaleScale}
-          availableQuota={availableQuota}
-          sourceImages={sourceImages}
-          imagePrompt={imagePrompt}
-          hasGenerateReferences={hasGenerateReferences}
-          isSubmitting={isSubmitting}
-          textareaRef={textareaRef}
-          uploadInputRef={uploadInputRef}
-          maskInputRef={maskInputRef}
-          onModeChange={handleModeChange}
-          onImageCountChange={setImageCount}
-          onImageSizeChange={setImageSize}
-          onImageQualityChange={setImageQuality}
-          onUpscaleScaleChange={setUpscaleScale}
-          onPromptChange={setImagePrompt}
-          onPromptPaste={handlePromptPaste}
-          onRemoveSourceImage={handleRemoveSourceImage}
-          onAppendFiles={handleAppendFiles}
-          onMobileCollapsedChange={setIsMobileComposerCollapsed}
-          onSubmit={handleSubmit}
-        />
-      </div>
+      <ImageEditModal
+        key={editorTarget?.imageName || "image-edit-modal"}
+        open={Boolean(editorTarget)}
+        imageName={editorTarget?.imageName || "image.png"}
+        imageSrc={editorTarget?.sourceDataUrl || ""}
+        isSubmitting={false}
+        allowOutputOptions={Boolean(editorTarget)}
+        imageAspectRatio={imageAspectRatio}
+        imageAspectRatioOptions={imageAspectRatioOptions}
+        imageResolutionTier={imageResolutionTier}
+        imageResolutionTierOptions={imageResolutionTierOptions}
+        imageQuality={imageQuality}
+        imageQualityOptions={imageQualityOptions}
+        imageQualityDisabled={!isImageQualityEnabled}
+        imageQualityDisabledReason={imageQualityDisabledReason}
+        onImageAspectRatioChange={(value) =>
+          setImageAspectRatio(value as ImageAspectRatio)
+        }
+        onImageResolutionTierChange={(value) =>
+          setImageResolutionTier(value as ImageResolutionTier)
+        }
+        onImageQualityChange={(value) => setImageQuality(value as ImageQuality)}
+        onClose={closeSelectionEditor}
+        onSubmit={async (payload) => {
+          await handleSelectionEditSubmit(payload);
+        }}
+      />
     </section>
   );
 }

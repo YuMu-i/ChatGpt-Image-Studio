@@ -20,11 +20,12 @@ export function TopNav() {
   const { pathname } = useLocation();
   const { user, logout } = usePortalSession();
   const [versionLabel, setVersionLabel] = useState("读取中");
-  const [collapsed, setCollapsed] = useState(pathname.startsWith("/workspace"));
+  const isWorkspacePath = pathname.startsWith("/workspace") || pathname.startsWith("/image/");
+  const [collapsed, setCollapsed] = useState(isWorkspacePath);
 
   useEffect(() => {
-    setCollapsed(pathname.startsWith("/workspace"));
-  }, [pathname]);
+    setCollapsed(isWorkspacePath);
+  }, [isWorkspacePath]);
 
   useEffect(() => {
     let cancelled = false;
@@ -87,7 +88,7 @@ export function TopNav() {
 
           <nav className="mt-3 grid gap-2">
             {navItems.map((item) => {
-              const active = pathname === item.href;
+              const active = pathname === item.href || (item.href === "/workspace" && isWorkspacePath);
               const Icon = item.icon;
               return (
                 <Link
@@ -148,7 +149,7 @@ export function TopNav() {
 
           <nav className="mt-4 space-y-1">
             {navItems.map((item) => {
-              const active = pathname === item.href;
+              const active = pathname === item.href || (item.href === "/workspace" && isWorkspacePath);
               const Icon = item.icon;
               return (
                 <Link
