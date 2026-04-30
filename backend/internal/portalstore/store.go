@@ -81,6 +81,7 @@ type GalleryListOptions struct {
 	Search       string
 	Sort         string
 	Limit        int
+	Offset       int
 }
 
 type LikeToggleResult struct {
@@ -147,6 +148,8 @@ func (s *Store) init() error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_portal_gallery_works_created_at ON portal_gallery_works(created_at DESC);`,
 		`CREATE INDEX IF NOT EXISTS idx_portal_gallery_works_user_id ON portal_gallery_works(user_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_portal_gallery_works_like_created ON portal_gallery_works(like_count DESC, created_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_portal_gallery_works_comment_created ON portal_gallery_works(comment_count DESC, created_at DESC);`,
 		`CREATE TABLE IF NOT EXISTS portal_gallery_likes (
 			work_id TEXT NOT NULL,
 			user_id TEXT NOT NULL,
@@ -276,7 +279,11 @@ func (s *Store) PublishWork(ctx context.Context, input PublishInput) (GalleryWor
 func (s *Store) ListWorks(ctx context.Context, options GalleryListOptions) ([]GalleryWork, error) {
 	limit := options.Limit
 	if limit <= 0 || limit > 120 {
-		limit = 60
+		limit = 24
+	}
+	offset := options.Offset
+	if offset < 0 {
+		offset = 0
 	}
 	search := strings.TrimSpace(options.Search)
 	searchLike := likePattern(search)
@@ -320,6 +327,7 @@ func (s *Store) ListWorks(ctx context.Context, options GalleryListOptions) ([]Ga
 		)
 		ORDER BY %s
 		LIMIT ?
+		OFFSET ?
 	`, orderBy)
 
 	rows, err := s.db.QueryContext(
@@ -333,6 +341,7 @@ func (s *Store) ListWorks(ctx context.Context, options GalleryListOptions) ([]Ga
 		searchLike,
 		searchLike,
 		limit,
+		offset,
 	)
 	if err != nil {
 		return nil, err

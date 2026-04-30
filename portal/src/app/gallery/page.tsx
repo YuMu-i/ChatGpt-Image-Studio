@@ -50,6 +50,8 @@ const sortOptions: Array<{ value: GallerySort; label: string; description: strin
   { value: "comments", label: "评论最多", description: "优先展示讨论最活跃的作品" },
 ];
 
+const GALLERY_PAGE_SIZE = 24;
+
 function formatDate(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
@@ -139,6 +141,8 @@ export default function GalleryPage() {
   const { user: currentUser } = usePortalSession();
   const [works, setWorks] = useState<PortalGalleryWork[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
   const [sort, setSort] = useState<GallerySort>("latest");
   const [searchInput, setSearchInput] = useState("");
   const [query, setQuery] = useState("");
@@ -152,20 +156,39 @@ export default function GalleryPage() {
   const [zoomedImageUrl, setZoomedImageUrl] = useState<string | null>(null);
   const [copiedType, setCopiedType] = useState<string | null>(null);
 
-  const loadWorks = useCallback(async (nextSort: GallerySort, nextQuery: string, silent = false) => {
-    if (!silent) {
+  const loadWorks = useCallback(async (
+    nextSort: GallerySort,
+    nextQuery: string,
+    options: { append?: boolean; offset?: number; silent?: boolean } = {},
+  ) => {
+    const append = Boolean(options.append);
+    const offset = options.offset ?? 0;
+    if (append) {
+      setIsLoadingMore(true);
+    } else if (!options.silent) {
       setIsLoading(true);
     }
     try {
       const payload = await fetchPortalGalleryWorks({
         sort: nextSort,
         query: nextQuery,
+        limit: GALLERY_PAGE_SIZE,
+        offset,
       });
-      setWorks(payload.items);
+      setWorks((current) => {
+        if (!append) {
+          return payload.items;
+        }
+        const existingIds = new Set(current.map((item) => item.id));
+        return [...current, ...payload.items.filter((item) => !existingIds.has(item.id))];
+      });
+      setHasMore(payload.has_more);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "读取作品广场失败");
     } finally {
-      if (!silent) {
+      if (append) {
+        setIsLoadingMore(false);
+      } else if (!options.silent) {
         setIsLoading(false);
       }
     }
@@ -288,7 +311,7 @@ export default function GalleryPage() {
         </div>
 
         <div className="rounded-[26px] border border-stone-200 bg-white px-5 py-4 shadow-[0_14px_40px_rgba(15,23,42,0.05)]">
-          <div className="text-xs font-medium text-stone-500">广场作品</div>
+          <div className="text-xs font-medium text-stone-500">已加载作品</div>
           <div className="mt-2 text-3xl font-semibold tracking-tight text-stone-950">{galleryStats.works}</div>
         </div>
         <div className="rounded-[26px] border border-stone-200 bg-white px-5 py-4 shadow-[0_14px_40px_rgba(15,23,42,0.05)]">
@@ -301,7 +324,7 @@ export default function GalleryPage() {
         </div>
       </div>
 
-      <div className="min-h-0 overflow-hidden rounded-[30px] border border-stone-200 bg-white shadow-[0_14px_40px_rgba(15,23,42,0.05)]">
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-[30px] border border-stone-200 bg-white shadow-[0_14px_40px_rgba(15,23,42,0.05)]">
         <div className="border-b border-stone-100 px-6 py-5">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
             <div>
@@ -361,7 +384,7 @@ export default function GalleryPage() {
           </div>
         </div>
 
-        <div className="hide-scrollbar h-full overflow-auto px-5 py-5">
+        <div className="min-h-0 flex-1 overflow-auto px-5 py-5">
           {isLoading ? (
             <div className="grid min-h-[320px] place-items-center text-stone-500">
               <div className="flex items-center gap-3">
@@ -374,9 +397,10 @@ export default function GalleryPage() {
               当前还没有可展示的公开作品。先在“我的作品”或“图片工作台”中发布几张作品到广场吧。
             </div>
           ) : (
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
-              {works.map((work) => (
-                <article
+            <div className="space-y-5">
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+                {works.map((work) => (
+                  <article
                   key={work.id}
                   className="group overflow-hidden rounded-[18px] border border-stone-200 bg-white shadow-[0_8px_22px_rgba(15,23,42,0.08)] transition-all hover:-translate-y-0.5 hover:shadow-[0_18px_45px_rgba(15,23,42,0.12)]"
                 >
@@ -388,6 +412,8 @@ export default function GalleryPage() {
                       src={work.image_url}
                       alt={work.title}
                       className="block h-full w-full object-cover transition duration-500 group-hover:scale-105"
+                      loading="lazy"
+                      decoding="async"
                     />
                     <button
                       type="button"
@@ -505,8 +531,23 @@ export default function GalleryPage() {
                       <span className="text-right text-stone-500">{formatCardDate(work.created_at)}</span>
                     </div>
                   </div>
-                </article>
-              ))}
+                  </article>
+                ))}
+              </div>
+              {hasMore ? (
+                <div className="flex justify-center pt-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-11 rounded-2xl border-stone-200 bg-white px-6 font-medium text-stone-700"
+                    disabled={isLoadingMore}
+                    onClick={() => void loadWorks(sort, query, { append: true, offset: works.length, silent: true })}
+                  >
+                    {isLoadingMore ? <LoaderCircle className="mr-2 size-4 animate-spin" /> : null}
+                    {isLoadingMore ? "正在加载..." : "加载更多作品"}
+                  </Button>
+                </div>
+              ) : null}
             </div>
           )}
         </div>

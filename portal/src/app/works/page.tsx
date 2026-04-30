@@ -48,6 +48,8 @@ const modeLabelMap = {
   upscale: "放大",
 } as const;
 
+const WORKS_PAGE_SIZE = 24;
+
 function buildImageDataUrl(image: StoredImage) {
   if (image.url) {
     return image.url;
@@ -173,6 +175,7 @@ function flattenWorks(conversations: ImageConversation[]) {
 
 export default function WorksPage() {
   const [works, setWorks] = useState<MyWorkItem[]>([]);
+  const [visibleCount, setVisibleCount] = useState(WORKS_PAGE_SIZE);
   const [records, setRecords] = useState<Record<string, GalleryPublishRecord>>({});
   const [isLoading, setIsLoading] = useState(true);
   const [selectedWork, setSelectedWork] = useState<MyWorkItem | null>(null);
@@ -192,6 +195,7 @@ export default function WorksPage() {
           return;
         }
         setWorks(flattenWorks(conversations));
+        setVisibleCount(WORKS_PAGE_SIZE);
         setRecords(publishRecords);
       } catch (error) {
         if (!cancelled) {
@@ -214,6 +218,8 @@ export default function WorksPage() {
     () => works.filter((item) => Boolean(records[item.key])).length,
     [records, works],
   );
+  const visibleWorks = useMemo(() => works.slice(0, visibleCount), [visibleCount, works]);
+  const hasMoreWorks = visibleCount < works.length;
 
   const handlePublish = async (work: MyWorkItem) => {
     if (records[work.key]) {
@@ -281,7 +287,7 @@ export default function WorksPage() {
         </div>
       </div>
 
-      <div className="min-h-0 overflow-hidden rounded-[24px] border border-stone-200 bg-white shadow-[0_14px_40px_rgba(15,23,42,0.05)]">
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-[24px] border border-stone-200 bg-white shadow-[0_14px_40px_rgba(15,23,42,0.05)]">
         <div className="flex items-center justify-between border-b border-stone-100 px-6 py-4">
           <div>
             <h2 className="text-base font-semibold tracking-tight text-stone-950">本地作品列表</h2>
@@ -289,7 +295,7 @@ export default function WorksPage() {
           </div>
         </div>
 
-        <div className="hide-scrollbar h-full overflow-auto px-5 py-5">
+        <div className="min-h-0 flex-1 overflow-auto px-5 py-5">
           {isLoading ? (
             <div className="grid min-h-[320px] place-items-center text-stone-500">
               <div className="flex items-center gap-3">
@@ -302,8 +308,9 @@ export default function WorksPage() {
               还没有本地作品。先去图片工作台生成一批图片，这里会自动读取当前浏览器保存的结果。
             </div>
           ) : (
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
-              {works.map((work) => {
+            <div className="space-y-5">
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
+              {visibleWorks.map((work) => {
                 const published = Boolean(records[work.key]);
                 const publishing = publishingKey === work.key;
                 return (
@@ -319,6 +326,8 @@ export default function WorksPage() {
                         src={work.imageUrl}
                         alt={work.title}
                         className="block h-full w-full object-cover transition duration-500 group-hover:scale-105"
+                        loading="lazy"
+                        decoding="async"
                       />
 
                       {/* Top Right Publish Status */}
@@ -413,6 +422,19 @@ export default function WorksPage() {
                   </article>
                 );
               })}
+              </div>
+              {hasMoreWorks ? (
+                <div className="flex justify-center pt-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-11 rounded-2xl border-stone-200 bg-white px-6 font-medium text-stone-700"
+                    onClick={() => setVisibleCount((current) => Math.min(current + WORKS_PAGE_SIZE, works.length))}
+                  >
+                    加载更多作品
+                  </Button>
+                </div>
+              ) : null}
             </div>
           )}
         </div>

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -413,16 +414,44 @@ func (s *Server) handlePortalGalleryWorks(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	limit := parsePortalPositiveInt(r.URL.Query().Get("limit"), 24, 1, 60)
+	offset := parsePortalPositiveInt(r.URL.Query().Get("offset"), 0, 0, 10000)
 	items, err := store.ListWorks(r.Context(), portalstore.GalleryListOptions{
 		ViewerUserID: user.ID,
 		Search:       strings.TrimSpace(r.URL.Query().Get("query")),
 		Sort:         strings.TrimSpace(r.URL.Query().Get("sort")),
+		Limit:        limit + 1,
+		Offset:       offset,
 	})
 	if err != nil {
 		writeJSON(w, statusForPortalGalleryError(err), map[string]any{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":       items,
+		"has_more":    hasMore,
+		"limit":       limit,
+		"offset":      offset,
+		"next_offset": offset + len(items),
+	})
+}
+
+func parsePortalPositiveInt(raw string, fallback, minValue, maxValue int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return fallback
+	}
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
 }
 
 func (s *Server) handlePortalGalleryWork(w http.ResponseWriter, r *http.Request) {

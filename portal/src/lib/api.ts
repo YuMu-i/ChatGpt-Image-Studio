@@ -93,6 +93,10 @@ export type PortalGalleryComment = {
 
 export type PortalGalleryWorksResponse = {
   items: PortalGalleryWork[];
+  has_more: boolean;
+  limit: number;
+  offset: number;
+  next_offset: number;
 };
 
 export type PortalGalleryWorkResponse = {
@@ -317,13 +321,19 @@ export async function updatePortalUser(userId: string, updates: { role?: "admin"
   );
 }
 
-export async function fetchPortalGalleryWorks(params: { sort?: string; query?: string } = {}) {
+export async function fetchPortalGalleryWorks(params: { sort?: string; query?: string; limit?: number; offset?: number } = {}) {
   const search = new URLSearchParams();
   if (params.sort?.trim()) {
     search.set("sort", params.sort.trim());
   }
   if (params.query?.trim()) {
     search.set("query", params.query.trim());
+  }
+  if (typeof params.limit === "number" && Number.isFinite(params.limit)) {
+    search.set("limit", String(params.limit));
+  }
+  if (typeof params.offset === "number" && Number.isFinite(params.offset)) {
+    search.set("offset", String(params.offset));
   }
   const suffix = search.toString() ? `?${search.toString()}` : "";
   return httpRequest<PortalGalleryWorksResponse>(`/portal/api/gallery/works${suffix}`);
