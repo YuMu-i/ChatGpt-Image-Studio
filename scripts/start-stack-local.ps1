@@ -1,9 +1,9 @@
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
 param(
   [int]$Port = 7000
 )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
 function Assert-LastExitCode {
   param(
@@ -25,7 +25,7 @@ function Ensure-NodeModules {
   try {
     if (-not (Test-Path "node_modules")) {
       Write-Host "Installing $Label dependencies..."
-      npm ci
+      npm.cmd ci
       Assert-LastExitCode "npm ci"
     }
   } finally {
@@ -42,7 +42,7 @@ function Start-Watcher {
   Push-Location $Dir
   try {
     Write-Host "Building $Label once before watch..."
-    npm run build
+    npm.cmd run build
     Assert-LastExitCode "npm run build"
   } finally {
     Pop-Location
@@ -57,7 +57,7 @@ function Start-Watcher {
     Remove-Item $err -Force
   }
 
-  $watcher = Start-Process -FilePath "npm.cmd" -ArgumentList @("run", "build:watch") -WorkingDirectory $Dir -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+  $watcher = Start-Process -FilePath "npm.cmd" -ArgumentList @("run", "build:watch") -WorkingDirectory $Dir -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err
   Start-Sleep -Seconds 2
   if ($watcher.HasExited) {
     throw "$Label watcher exited early, see $err"

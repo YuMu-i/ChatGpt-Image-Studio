@@ -1,10 +1,10 @@
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
 param(
   [string]$ApiTarget = "https://mimo.iqei.cn",
   [int]$Port = 5174
 )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
 function Assert-LastExitCode {
   param(
@@ -28,7 +28,7 @@ Push-Location $portalDir
 try {
   if (-not (Test-Path "node_modules")) {
     Write-Host "[1/2] Installing portal frontend dependencies..."
-    npm ci
+    npm.cmd ci
     Assert-LastExitCode "npm ci"
   }
 
@@ -36,7 +36,7 @@ try {
   Write-Host "Proxy target: $target"
   $env:VITE_API_PROXY_TARGET = $target
   Remove-Item Env:VITE_API_URL -ErrorAction SilentlyContinue
-  npm run dev -- --port $Port
+  npm.cmd run dev -- --port=$Port
   Assert-LastExitCode "npm run dev"
 } finally {
   Pop-Location
