@@ -1,6 +1,11 @@
 "use client";
 
-import type { InpaintSourceReference, ImageModel, ImageQuality } from "@/lib/api";
+import type {
+  InpaintSourceReference,
+  ImageModel,
+  ImageQuality,
+  ImageResolutionAccess,
+} from "@/lib/api";
 import type {
   ImageConversationTurn,
   ImageMode,
@@ -35,12 +40,14 @@ export function createConversationTurn(payload: {
   model: ImageModel;
   count: number;
   size?: string;
+  resolutionAccess?: ImageResolutionAccess;
   quality?: ImageQuality;
   scale?: string;
   sourceImages?: StoredSourceImage[];
+  sourceReference?: InpaintSourceReference;
   images: StoredImage[];
   createdAt: string;
-  status: "generating" | "success" | "error";
+  status: "queued" | "running" | "generating" | "success" | "error" | "cancelled";
   error?: string;
 }): ImageConversationTurn {
   return {
@@ -51,9 +58,11 @@ export function createConversationTurn(payload: {
     model: payload.model,
     count: payload.count,
     size: payload.size,
+    resolutionAccess: payload.resolutionAccess,
     quality: payload.quality,
     scale: payload.scale,
     sourceImages: payload.sourceImages ?? [],
+    sourceReference: payload.sourceReference,
     images: payload.images,
     createdAt: payload.createdAt,
     status: payload.status,

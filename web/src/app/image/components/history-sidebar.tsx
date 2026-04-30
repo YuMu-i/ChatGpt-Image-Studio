@@ -58,7 +58,7 @@ export const HistorySidebar = memo(
     return (
       <aside
         className={cn(
-          "overflow-hidden rounded-[28px] border border-stone-200 bg-[#f8f8f7] shadow-[0_8px_30px_rgba(15,23,42,0.04)]",
+          "overflow-hidden rounded-[28px] border border-stone-200 bg-[#f8f8f7] shadow-[0_8px_30px_rgba(15,23,42,0.04)] transition-colors duration-200 dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel)] dark:shadow-[0_20px_50px_-32px_rgba(0,0,0,0.7)]",
           standalone
             ? "min-h-[420px]"
             : "order-2 max-h-[36vh] lg:order-none lg:max-h-none lg:min-h-0",
@@ -68,17 +68,17 @@ export const HistorySidebar = memo(
           <div className="border-b border-stone-200/80 px-4 py-4">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <h2 className="text-lg font-semibold tracking-tight text-stone-900">
+                <h2 className="text-lg font-semibold tracking-tight text-stone-900 dark:text-[var(--studio-text-strong)]">
                   历史记录
                 </h2>
               </div>
-              <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-stone-500 shadow-sm">
+              <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-stone-500 shadow-sm dark:bg-[var(--studio-panel-soft)] dark:text-[var(--studio-text)]">
                 {conversations.length}
               </span>
             </div>
             <div className="mt-4 flex items-center gap-2">
               <Button
-                className="h-11 flex-1 rounded-2xl bg-stone-950 text-white hover:bg-stone-800"
+                className="h-11 flex-1 rounded-2xl bg-stone-950 text-white hover:bg-stone-800 dark:bg-[var(--studio-accent-strong)] dark:text-[var(--studio-accent-foreground)] dark:hover:bg-[var(--studio-accent)]"
                 onClick={onCreateDraft}
               >
                 <MessageSquarePlus className="size-4" />
@@ -86,7 +86,7 @@ export const HistorySidebar = memo(
               </Button>
               <Button
                 variant="outline"
-                className="h-11 rounded-2xl border-stone-200 bg-white px-3 text-stone-600 hover:bg-stone-50"
+                className="h-11 rounded-2xl border-stone-200 bg-white px-3 text-stone-600 hover:bg-stone-50 dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel-soft)] dark:text-[var(--studio-text)] dark:hover:bg-[var(--studio-panel-muted)]"
                 onClick={() => void onClearHistory()}
                 disabled={conversations.length === 0 || hasActiveTasks}
                 title={
@@ -120,11 +120,11 @@ export const HistorySidebar = memo(
                   return (
                     <div
                       key={conversation.id}
-                      className={cn(
-                        "group rounded-[22px] border p-2 transition",
-                        active
-                          ? "border-stone-200 bg-white shadow-sm"
-                          : "border-transparent bg-transparent hover:border-stone-200/80 hover:bg-white/70",
+                        className={cn(
+                          "group rounded-[22px] border p-2 transition",
+                          active
+                          ? "border-stone-200 bg-white shadow-sm dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel-soft)]"
+                          : "border-transparent bg-transparent hover:border-stone-200/80 hover:bg-white/70 dark:hover:border-[var(--studio-border)] dark:hover:bg-[var(--studio-panel-soft)]",
                       )}
                     >
                       <div className="flex items-center gap-3">

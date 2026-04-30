@@ -41,6 +41,8 @@ type ImageWorkflowClient interface {
 		conversationID string,
 		parentMessageID string,
 		mask []byte,
+		size string,
+		quality string,
 	) ([]ImageResult, error)
 }
 
@@ -105,7 +107,11 @@ func (c *ResponsesClient) InpaintImageByMask(
 	conversationID string,
 	parentMessageID string,
 	mask []byte,
+	size string,
+	quality string,
 ) ([]ImageResult, error) {
+	_ = size
+	_ = quality
 	return nil, fmt.Errorf("selection edit requires conversation context")
 }
 
@@ -514,11 +520,17 @@ func normalizeResponsesImageBackground(value string) string {
 
 func normalizeResponsesImageToolModel(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "gpt-image-1":
-		return "gpt-image-1"
-	case "gpt-image-2":
-		return "gpt-image-2"
+	case "", "auto", "gpt-image-1", "gpt-image-2":
+		return ""
+	case "gpt-5.4-mini":
+		return "gpt-5.4-mini"
+	case "gpt-5.4":
+		return "gpt-5.4"
+	case "gpt-5.5":
+		return "gpt-5.5"
+	case "gpt-5-5-thinking":
+		return "gpt-5-5-thinking"
 	default:
-		return "gpt-image-2"
+		return ""
 	}
 }
